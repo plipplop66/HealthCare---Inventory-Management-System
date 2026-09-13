@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 
@@ -25,6 +25,8 @@ class ProjectedDay:
     demand: float
     closing_stock: float
     unmet_demand: float
+    # Stock that left the facility at the start of the day (simulated outbound transfers).
+    withdrawal: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,8 @@ class StockProjection:
     replenishment_timing: str
     # Calendar date of day 1; when given, the stockout day is also reported as a date.
     start_date: date | None = None
+    # Requested withdrawals that exceeded the stock available on their day and could not leave.
+    withdrawal_shortfall: float = 0.0
 
     @property
     def projected_within_horizon(self) -> bool:
@@ -70,6 +74,7 @@ def project_stock(
     horizon_days: int,
     replenishments: Sequence[Replenishment] = (),
     start_date: date | None = None,
+    withdrawals: Mapping[int, float] | None = None,
 ) -> StockProjection:
     """Project stock one day at a time.
 
@@ -77,6 +82,11 @@ def project_stock(
     arriving that day. Replenishment is applied at the start of its day, stock is
     floored at zero, and demand that cannot be met is recorded as unmet rather than
     carried forward. Day 1 is start_date (the as-of date) when provided.
+
+    withdrawals maps a day to a quantity leaving the facility (the Ripple Simulator's outbound
+    transfers). It leaves at the start of the day, before that day's replenishment and demand,
+    and never takes stock below zero; any amount that is not available is reported as
+    withdrawal_shortfall. Without withdrawals the projection is unchanged.
     """
     if effective_stock < 0:
         raise ValueError("effective_stock cannot be negative.")
@@ -84,6 +94,8 @@ def project_stock(
         raise ValueError("daily_demand cannot be negative.")
     if horizon_days < 1:
         raise ValueError("horizon_days must be at least 1.")
+    if withdrawals and any(quantity < 0 for quantity in withdrawals.values()):
+        raise ValueError("withdrawals cannot be negative.")
 
     scheduled = sorted((item for item in replenishments if item.arrival_day >= 1), key=lambda item: item.arrival_day)
     arrivals: dict[int, float] = {}
@@ -96,7 +108,13 @@ def project_stock(
     restored_day = None
     total_shortage_days = 0
     unmet_total = 0.0
+    shortfall_total = 0.0
     for day in range(1, horizon_days + 1):
+        opening = stock
+        requested = withdrawals.get(day, 0.0) if withdrawals else 0.0
+        withdrawal = min(requested, stock)
+        shortfall_total += requested - withdrawal
+        stock -= withdrawal
         replenishment = arrivals.get(day, 0.0)
         available = stock + replenishment
         closing = max(0.0, available - daily_demand)
@@ -110,7 +128,7 @@ def project_stock(
             if stockout_day is not None and restored_day is None:
                 restored_day = day
         unmet_total += unmet
-        days.append(ProjectedDay(day, stock, replenishment, daily_demand, closing, unmet))
+        days.append(ProjectedDay(day, opening, replenishment, daily_demand, closing, unmet, withdrawal))
         stock = closing
 
     if stockout_day is None:
@@ -147,4 +165,5 @@ def project_stock(
         next_replenishment=next_replenishment,
         replenishment_timing=timing,
         start_date=start_date,
+        withdrawal_shortfall=shortfall_total,
     )

@@ -6,6 +6,7 @@ A standalone Python FastAPI service that forecasts medicine demand, projects sto
 
 - **In Python:** `analyse_shortage(facility_data)`, the Day 1 entry point.
 - **Over HTTP:** `POST /forecast`. When the Node backend's `INTELLIGENCE_SERVICE_URL` points at this service, `POST /api/forecast` returns `source: "INTELLIGENCE_SERVICE"` instead of a fallback.
+- **Ripple Simulator:** `POST /scenarios/simulate` projects every facility before and after proposed transfers, with the same forecast and projection, and says whether they are safe to recommend. See [Ripple Simulator](#ripple-simulator-post-scenariossimulate).
 
 The HTTP service reads either the offline Navjeevan PHC fixture or Dhiren's MySQL database (see [Data sources](#data-sources)). Both use the same calculation code, so they always return the same numbers for the same data. Day 1 is intentionally transparent: a weighted moving average and simple rules, with no deep learning, LLMs or randomness.
 
@@ -88,12 +89,14 @@ Warehouses dispense stock rather than consume it, so the seed has no consumption
 
 ### Tests
 
-`python -m pytest` never needs Docker or MySQL. `tests/conftest.py` pins the ordinary suite to the fixture, and `tests/test_mysql_store.py` exercises the MySQL store with in-memory rows. The real-database checks in `tests/test_mysql_live.py` run only when opted in:
+`python -m pytest` never needs Docker or MySQL. `tests/conftest.py` pins the ordinary suite to the fixture. `tests/test_mysql_store.py` exercises the MySQL store, and `tests/test_simulator.py` and `tests/test_simulator_api.py` exercise the Ripple Simulator, with in-memory rows (`tests/simulator_support.py`) and the fixture. The real-database checks in `tests/test_mysql_live.py` and `tests/test_simulator_live.py` run only when opted in:
 
 ```powershell
 $env:MEDRIPPLE_LIVE_MYSQL = "1"; $env:DATABASE_PASSWORD = "medripple_dev_only"
-.\.venv\Scripts\python -m pytest tests/test_mysql_live.py
+.\.venv\Scripts\python -m pytest tests/test_mysql_live.py tests/test_simulator_live.py
 ```
+
+Run only the simulator tests with `.\.venv\Scripts\python -m pytest tests/test_simulator.py tests/test_simulator_api.py`.
 
 ## Day 1: `analyse_shortage(facility_data)`
 
@@ -227,6 +230,116 @@ Errors use `{ "error": { "code", "message", "details"? } }`.
 
 The Node backend validates requests itself (returning 400) before calling this service, and converts any error from this service into its labelled fallback (`FIXTURE_FALLBACK` or `DATABASE_FALLBACK`).
 
+## Ripple Simulator: `POST /scenarios/simulate`
+
+> **Simulated decision support only.** All data is simulated. A qualified person must review and approve every operational transfer before any stock moves. The simulator never substitutes one medicine for another, never writes a transfer and never changes inventory.
+
+The simulator shows what happens to **every facility holding the medicine** if one or more proposed transfers are carried out. It answers:
+
+- Does the recipient avoid its stockout?
+- Does a donor fall below protected stock or become critical?
+- Does any other facility become unsafe?
+- Does regional shortage get better or worse?
+- Is the scenario safe to recommend, and why is each transfer accepted or rejected?
+
+It is not connected to the Node `/api/scenarios/simulate` route yet; see [Backend changes requested](#backend-changes-requested).
+
+### Request
+
+The same shape the Node backend accepts (`backend/src/validation.js`):
+
+```json
+{
+  "horizonDays": 14,
+  "transfers": [
+    { "fromFacilityId": "WH-TN-001", "toFacilityId": "PHC-VLR-001", "medicineId": "7", "quantity": 300, "arrivalDay": 1 }
+  ]
+}
+```
+
+| Field | Rule |
+| --- | --- |
+| `horizonDays` | `7`, `14` or `30`; defaults to `14` (422 `INVALID_HORIZON` otherwise) |
+| `transfers` | 1 to 50 transfers, all evaluated together |
+| `fromFacilityId`, `toFacilityId` | Non-empty and different; resolved through the active data source (database code or numeric ID in MySQL mode) |
+| `medicineId` | Resolved through the active data source; every transfer must be the same exact medicine |
+| `quantity` | Positive number in the medicine's unit; decimals are kept |
+| `arrivalDay` | Whole number of at least 1; defaults to `1`. Day 1 is the as-of date |
+
+Malformed requests return 422 `INVALID_REQUEST`. If none of the requested medicines exists the response is 404 `MEDICINE_NOT_FOUND`; an unknown facility is reported as a rejected transfer. MySQL outages return 503 `DATABASE_UNAVAILABLE`.
+
+### Response
+
+| Field | Meaning |
+| --- | --- |
+| `medicine` | `id`, `genericName`, `strength`, `dosageForm`, `unit`, `criticality`, `requiresColdChain` |
+| `baseline`, `intervention` | `criticalFacilityCount`, `stockoutFacilityCount`, `regionalShortageDays`, `regionalUnmetDemand`, `regionalRisk` (highest facility score), `averageRisk`, `appliedTransferCount`, `facilities[]` |
+| `facilities[]` | `facilityId`, `facilityName`, `role`, `effectiveStock`, `transferIn`, `transferOut`, `stockAfterTransfers`, `protectedStock`, `predictedDailyDemand`, `demandBasis`, `daysRemaining`, `stockoutDay` / `stockoutDate`, `shortageDays`, `unmetDemand`, `minimumProjectedStock`, `endingStock`, `belowProtectedStock`, `riskScore`, `riskLabel`, and `projectedDailyStock[]` (`openingStock`, `transferOut`, `scheduledReplenishment`, `transferIn`, `demand`, `closingStock`, `unmetDemand` per day) |
+| `transferEvaluations[]` | The request fields plus `departureDay`, `eligible`, `applied`, `rejectionReasons[]`, `rejectionCodes[]`, `route` (`distanceKm`, `travelHours`, `coldChainAvailable`), `batches[]` and a plain-language `explanation` |
+| `comparison` | `recipientStockoutPrevented`, `recipientOutcomes[]`, `newShortagesCreated[]`, `newCriticalFacilities[]`, `newRisks[]`, `improvedFacilities[]`, `worsenedFacilities[]`, shortage days and unmet demand before/after with `shortageDaysPrevented` and `unmetDemandReduced`, `criticalFacilityDelta`, `regionalRiskBefore` / `regionalRiskAfter`, `regionalOutcome` (`IMPROVED`, `WORSENED`, `MIXED`, `UNCHANGED`), `safeToRecommend` and `summary` |
+| `assumptions`, `limitations`, `decisionSupportOnly`, `dataContext` | Modelling rules, known gaps, always `true`, and data source, simulation and as-of dates, history window, unit, mappings and notes |
+
+`scenarioType` (`SIMULATED_DATABASE` or `SIMULATED_FIXTURE`) and `medicineId` match the Node response.
+
+### Simulation algorithm
+
+1. **Load one regional snapshot.** MySQL: one read-only connection loads every facility's inventory, safety stock, replenishments and consumption for the medicine, plus the medicine catalogue, cold-chain flags and all routes. Fixture: the in-memory store is only read.
+2. **Baseline.** Every facility holding the medicine gets exactly the `POST /forecast` analysis: weighted-moving-average demand, day-by-day projection from effective stock with scheduled and delayed replenishments, protected stock, regional fragility and risk score. Tests check that each baseline facility matches `POST /forecast`.
+3. **Gate the transfers** (below). Transfers that cannot physically happen are not simulated.
+4. **Intervention.** Every remaining transfer is projected together:
+   - outbound stock leaves the donor at the start of its departure day, before that day's replenishment and demand, and never below zero;
+   - inbound stock arrives in full at the start of `arrivalDay`, like a replenishment.
+   The departure day is `arrivalDay` minus whole days of route travel time. Risk is rescored with the same formula, and regional fragility uses every facility's safe surplus after the transfers.
+5. **Impact checks.** Donor safety and recipient timing are checked on the simulated result. A transfer that fails them stays in the intervention, so the harm is visible, but it is not eligible.
+6. **Compare** baseline and intervention for every facility.
+
+A storage facility (warehouse) without consumption records is projected with zero clinical demand and no risk score. Any other facility whose demand cannot be forecast is excluded from regional totals and listed in `dataContext.notes`.
+
+### Feasibility gate
+
+| Code | Not simulated when |
+| --- | --- |
+| `SOURCE_FACILITY_NOT_FOUND`, `DESTINATION_FACILITY_NOT_FOUND`, `MEDICINE_NOT_FOUND` | An ID does not resolve in the active data source |
+| `SAME_SOURCE_AND_DESTINATION` | Both IDs resolve to one facility (for example a code and its numeric ID) |
+| `MEDICINE_IDENTITY_MISMATCH` | The transfer's medicine is not the scenario medicine; nothing is substituted |
+| `INCOMPLETE_DATA` | No inventory record, no usable forecast, unknown cold-chain requirement, or routes not loaded |
+| `ROUTE_NOT_FOUND` | No directed route from donor to recipient |
+| `COLD_CHAIN_UNAVAILABLE` | The medicine needs a cold chain and the route (or recipient storage) lacks one |
+| `TRAVEL_TIME_EXCEEDS_ARRIVAL_DAY`, `ARRIVAL_OUTSIDE_HORIZON` | The transfer cannot arrive by `arrivalDay`, or arrives after the horizon |
+| `INSUFFICIENT_DONOR_STOCK` | The donor is projected to hold less usable stock than requested when it departs (expired, quarantined and reserved stock never count) |
+| `BATCH_EXPIRES_BEFORE_USE` | Not enough of the donor's usable batches stay in date until the end of the horizon |
+| `INVALID_QUANTITY`, `INVALID_ARRIVAL_DAY` | Only reachable from Python; the API rejects these with 422 first |
+
+| Code | Simulated but not eligible when |
+| --- | --- |
+| `BELOW_PROTECTED_STOCK` | The donor's projected stock is below its protected safety stock on any day from departure to the end of the horizon |
+| `DONOR_BECOMES_CRITICAL` | The donor's risk label is CRITICAL with the transfers |
+| `CREATES_REGIONAL_SHORTAGE` | The donor gains a stockout, more shortage days or more unmet demand |
+| `ARRIVES_AFTER_RECIPIENT_STOCKOUT` | Without this transfer the recipient runs out before `arrivalDay` |
+
+A recipient that is already critical is never a reason to reject; helping it is the purpose.
+
+**`safeToRecommend`** is true only when at least one transfer was simulated, every transfer is eligible, no facility gains a new risk (`NEW_STOCKOUT`, `MORE_SHORTAGE`, `NEW_CRITICAL`, `NEW_HIGH_RISK` or `FELL_BELOW_PROTECTED_STOCK`), and regional shortage is `IMPROVED` or `UNCHANGED`. So a transfer that saves the recipient but makes a donor critical returns `recipientStockoutPrevented: true`, the donor in `newShortagesCreated`, and `safeToRecommend: false`.
+
+### Data-source and unit rules
+
+- Fixture mode uses only the offline fixture, including the three routes of `backend/src/fixture-store.js`; database IDs are not found. MySQL mode uses only the database; fixture facility IDs are not found. The documented alias `med-insulin-100iu-vial` still resolves to Human Insulin.
+- Quantities stay in the medicine's base unit (`mg`, `mL`, `count`, or `vial` for the fixture) with their decimals.
+- MySQL mode uses `facility_safety_stock`, `routes` (distance, travel time, cold chain), `medicines.requires_cold_chain`, `facilities.has_cold_chain`, and `SCHEDULED` / `DELAYED` replenishments. Expired, quarantined and reserved stock is excluded. These rules are returned in `dataContext.mappings` as provisional (`routes`, `coldChain`, `donorSafety` for Aaryan, Dhiren and Sahil to confirm).
+
+### Read-only guarantee
+
+The simulator only reads. The MySQL session is opened with `SET SESSION TRANSACTION READ ONLY` and runs only `SELECT` statements. Transfers are held in per-request schedules and never written to the data store. Tests check that every simulator query is a `SELECT`, that the fixture store and forecasts are unchanged after simulating, and (live) that `inventory`, `batches`, `replenishments`, `transfers` and `audit_events` are unchanged.
+
+### Limitations
+
+- Risk weights are prototype assumptions and are not clinically validated.
+- Demand does not respond to transfers; patients are not redistributed.
+- Batch expiry within the horizon, transport losses, vehicle and storage capacity, and cost are not modelled.
+- Stock from replenishments arriving during the horizon has no recorded batch, so it is not sent onward.
+- Supplier reliability is ignored: delayed orders arrive on their current expected date.
+- One medicine per scenario. There is no optimizer yet: the simulator evaluates transfers you propose.
+
 ## Method
 
 ### 1. Forecast daily consumption
@@ -341,6 +454,12 @@ These are outside `intelligence/` and have not been made here:
 - `backend/src/intelligence-adapter.js` turns every non-2xx response from this service into a fallback with `fallbackReason: INTELLIGENCE_UNAVAILABLE`. A deliberate answer such as 422 `NO_CONSUMPTION_HISTORY` for `WH-TN-001` is therefore shown as a zero-demand `DATABASE_FALLBACK`. It should pass 4xx error codes through, or at least record them as the fallback reason.
 - `backend/src/mysql-store.js` returns DATE columns as local-midnight JavaScript dates, so `expectedArrivalDate` 2026-09-19 is serialised as `2026-09-18T18:30:00.000Z` on an IST machine. Adding `dateStrings: ['DATE']` to the pool options returns plain `YYYY-MM-DD` strings.
 - `compose.yaml` sets `INTELLIGENCE_SERVICE_URL` to an empty string, so the containerised stack never calls this service.
+- To use the Ripple Simulator from Node, `backend/src/scenario-service.js` `simulateScenario` (called by `/api/scenarios/simulate` and by `optimisePlan`) would call `POST /scenarios/simulate` through the intelligence adapter, with its current logic as the labelled fallback. The request shape already matches. Response differences to adapt:
+  - Node facilities report `dailyDemand`, `endingStock` as `effectiveStock`, and `patientDaysAtRisk`; Python reports `predictedDailyDemand`, `effectiveStock` (snapshot), `endingStock` and `unmetDemand`.
+  - Node counts any facility with a stockout as critical; Python's `criticalFacilityCount` counts CRITICAL risk labels and adds `stockoutFacilityCount`.
+  - Node applies only eligible transfers; Python also simulates transfers that fail impact checks, so the harm is visible, and marks them `applied: true, eligible: false`.
+  - `backend/src/validation.js` accepts a non-integer or missing `arrivalDay` as 1 and flags `arrivalDay < 1` per transfer; Python rejects such requests with 422.
+  - `optimisePlan` needs `batchId` for persistence; Python returns `batches[].batchNo`, and the database batch ID would have to be looked up.
 
 ## Layout
 
@@ -351,12 +470,13 @@ app/schemas.py           Request/response models (camelCase on the wire)
 app/data_store.py        In-memory data model, offline fixture, CSV loading and daily records
 app/mysql_store.py       Read-only MySQL data source: reads and normalises rows, no forecasting logic
 app/forecast.py          Weighted moving average, trend, anomaly detection, confidence
-app/stock_projection.py  Day-by-day effective-stock projection and stockout date
+app/stock_projection.py  Day-by-day effective-stock projection (with optional outbound withdrawals) and stockout date
 app/risk_engine.py       Risk score, cause detection, explanation, analyse_shortage
+app/simulator.py         Ripple Simulator: feasibility gate, baseline/intervention projection, regional comparison
 data/simulated_consumption.csv
-tests/                   pytest suite: fixture API and engine, MySQL store on in-memory rows, opt-in live MySQL checks
+tests/                   pytest suite: fixture API and engine, MySQL store and simulator on in-memory rows, opt-in live MySQL checks
 ```
 
-## Not in Step 1
+## Not implemented yet
 
-Ripple Simulator, transfer optimizer, OR-Tools and frontend work are out of scope. Batch expiry during the horizon is not modelled yet (no simulated batch expires within 30 days of the snapshot).
+The transfer optimizer, OR-Tools and frontend work are out of scope. The Ripple Simulator evaluates transfers a person proposes; it does not search for them. Batch expiry during the horizon is not modelled (no simulated batch expires within 30 days of the snapshot).

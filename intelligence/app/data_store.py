@@ -1,6 +1,6 @@
 """In-memory data model read by the intelligence engine, plus the offline Navjeevan PHC fixture.
 
-SimulatedDataStore holds one snapshot of facilities, medicines, inventory and daily consumption.
+SimulatedDataStore holds one snapshot of facilities, medicines, inventory, transport routes and daily consumption.
 It is filled from the fixture below (DATA_SOURCE=fixture) or by app/mysql_store.py from Dhiren's
 MySQL database (DATA_SOURCE=mysql). The forecast, projection and risk engine only reads this
 structure, so both data sources run exactly the same calculations.
@@ -47,6 +47,8 @@ class Medicine:
     unit: str
     criticality: str
     storage: str
+    # Whether storage and transport need a cold chain; None when the data source did not load it.
+    requires_cold_chain: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,8 @@ class Facility:
     protected_days: int | None
     # Remoteness exactly as stored by the data source, before scaling (None for the fixture).
     source_remoteness_score: float | None = None
+    # Whether the facility has cold-chain storage; None when the data source did not load it.
+    has_cold_chain: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,17 @@ class Replenishment:
     status: str = "EXPECTED"
     # Calendar date of arrival when the data source records one.
     expected_date: date | None = None
+
+
+@dataclass(frozen=True)
+class Route:
+    """A directed transport route between two facilities."""
+
+    origin_id: str
+    destination_id: str
+    distance_km: float
+    travel_hours: float
+    cold_chain_capable: bool
 
 
 @dataclass(frozen=True)
@@ -147,16 +162,28 @@ MEDICINES: dict[str, Medicine] = {
         unit="vial",
         criticality="HIGH",
         storage="2-8 C",
+        requires_cold_chain=True,
     ),
 }
 
+# Cold-chain flags follow backend/src/fixture-store.js, which treats every fixture facility as cold-chain capable.
 FACILITIES: dict[str, Facility] = {
     facility.id: facility
     for facility in (
-        Facility("facility-central-store", "Central District Store", "WAREHOUSE", "Medripple District", 0.05, 14),
-        Facility("facility-district-hospital", "District Hospital", "DISTRICT_HOSPITAL", "Medripple District", 0.15, 10),
-        Facility("facility-river-chc", "River CHC", "CHC", "Medripple District", 0.55, 10),
-        Facility("facility-navjeevan-phc", "Navjeevan PHC", "PHC", "Medripple District", 0.8, 14),
+        Facility("facility-central-store", "Central District Store", "WAREHOUSE", "Medripple District", 0.05, 14, has_cold_chain=True),
+        Facility("facility-district-hospital", "District Hospital", "DISTRICT_HOSPITAL", "Medripple District", 0.15, 10, has_cold_chain=True),
+        Facility("facility-river-chc", "River CHC", "CHC", "Medripple District", 0.55, 10, has_cold_chain=True),
+        Facility("facility-navjeevan-phc", "Navjeevan PHC", "PHC", "Medripple District", 0.8, 14, has_cold_chain=True),
+    )
+}
+
+# The three simulated routes of backend/src/fixture-store.js, all into Navjeevan PHC; no other pair has a route.
+ROUTES: dict[tuple[str, str], Route] = {
+    (route.origin_id, route.destination_id): route
+    for route in (
+        Route("facility-central-store", "facility-navjeevan-phc", 22.0, 1.2, True),
+        Route("facility-river-chc", "facility-navjeevan-phc", 14.0, 0.8, True),
+        Route("facility-district-hospital", "facility-navjeevan-phc", 18.0, 1.0, True),
     )
 }
 
@@ -260,6 +287,7 @@ class SimulatedDataStore:
         peer_scope: str = PEERS_IN_DISTRICT,
         facility_aliases: Mapping[str, str] | None = None,
         medicine_aliases: Mapping[str, str] | None = None,
+        routes: Mapping[tuple[str, str], Route] | None = ROUTES,
     ) -> None:
         if peer_scope not in (PEERS_IN_DISTRICT, PEERS_ALL_FACILITIES):
             raise ValueError(f"peer_scope must be {PEERS_IN_DISTRICT} or {PEERS_ALL_FACILITIES}.")
@@ -268,6 +296,8 @@ class SimulatedDataStore:
         self.medicines = dict(medicines)
         self.facilities = dict(facilities)
         self.inventory = dict(inventory)
+        # None means the data source did not load routes (the MySQL forecast path does not need them).
+        self.routes = None if routes is None else dict(routes)
         self.context = context
         self.peer_scope = peer_scope
         self.facility_aliases = dict(facility_aliases or {})
@@ -307,6 +337,13 @@ class SimulatedDataStore:
 
     def get_inventory(self, facility_id: str, medicine_id: str) -> InventorySnapshot | None:
         return self.inventory.get((facility_id, medicine_id))
+
+    def get_route(self, origin_id: str, destination_id: str) -> Route | None:
+        """The directed route between two facilities (IDs or aliases); None when there is none or routes were not loaded."""
+        origin, destination = self.get_facility(origin_id), self.get_facility(destination_id)
+        if self.routes is None or origin is None or destination is None:
+            return None
+        return self.routes.get((origin.id, destination.id))
 
     def regional_peers(self, facility: Facility, medicine_id: str) -> list[Facility]:
         """Other facilities holding the medicine: in the same district, or anywhere when peer_scope is ALL_FACILITIES."""

@@ -8,6 +8,7 @@ Dhiren's MySQL database through app/mysql_store.py and never falls back to the f
 """
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Protocol
@@ -29,6 +30,7 @@ from .forecast import (
     weighted_moving_average,
 )
 from .mysql_store import Connector, DatabaseDataError, DatabaseUnavailableError, MySQLDataSource
+from .simulator import SimulationError, run_simulation
 from .risk_engine import (
     DEFAULT_RISK_CONFIG,
     RiskConfig,
@@ -51,6 +53,8 @@ from .schemas import (
     ForecastRequest,
     ForecastResponse,
     HealthResponse,
+    SimulationRequest,
+    SimulationResponse,
     InventoryBlock,
     MedicineBlock,
     ProjectionDayBlock,
@@ -89,9 +93,11 @@ class DataSource(Protocol):
 
     def store_for(self, facility_id: str, medicine_id: str) -> SimulatedDataStore: ...
 
+    def regional_store_for(self, medicine_ids: Sequence[str]) -> SimulatedDataStore: ...
+
 
 class FixtureDataSource:
-    """The offline fixture: one in-memory snapshot shared by every request."""
+    """The offline fixture: one in-memory snapshot shared by every request. Requests only read it."""
 
     name = "FIXTURE"
 
@@ -99,6 +105,9 @@ class FixtureDataSource:
         self.store = store
 
     def store_for(self, facility_id: str, medicine_id: str) -> SimulatedDataStore:
+        return self.store
+
+    def regional_store_for(self, medicine_ids: Sequence[str]) -> SimulatedDataStore:
         return self.store
 
 
@@ -441,6 +450,25 @@ def create_app(
     def forecast(payload: ForecastRequest) -> ForecastResponse:
         store = data_source.store_for(payload.facility_id, payload.medicine_id)
         return run_forecast(store, payload, risk_config)
+
+    @app.exception_handler(SimulationError)
+    async def handle_simulation_error(request: Request, error: SimulationError) -> JSONResponse:
+        return error_response(error.status_code, error.code, error.message)
+
+    @app.post(
+        "/scenarios/simulate",
+        response_model=SimulationResponse,
+        responses={
+            404: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+            500: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
+    )
+    def simulate_scenario(payload: SimulationRequest) -> SimulationResponse:
+        """Ripple Simulator: read-only before/after projection of proposed transfers. Decision support only."""
+        store = data_source.regional_store_for([item.medicine_id for item in payload.transfers])
+        return run_simulation(store, payload, risk_config)
 
     return app
 

@@ -32,6 +32,7 @@ from .data_store import (
     InventorySnapshot,
     Medicine,
     Replenishment,
+    Route,
     SimulatedDataStore,
 )
 
@@ -93,6 +94,26 @@ SELECT facility_id, consumption_date, quantity_consumed
 FROM consumption
 WHERE medicine_id = %s AND consumption_date BETWEEN %s AND %s
 ORDER BY facility_id, consumption_date
+"""
+
+# The Ripple Simulator also needs cold-chain flags and routes. The forecast queries above stay unchanged.
+SIMULATION_MEDICINES_SQL = """
+SELECT medicine_id, generic_name, strength_value, strength_unit, form, base_unit,
+       storage_temp_min_c, storage_temp_max_c, criticality_level, requires_cold_chain
+FROM medicines
+ORDER BY medicine_id
+"""
+
+SIMULATION_FACILITIES_SQL = """
+SELECT facility_id, facility_code, name, facility_type, region, remoteness_score, has_cold_chain
+FROM facilities
+ORDER BY facility_id
+"""
+
+ROUTES_SQL = """
+SELECT origin_facility_id, destination_facility_id, distance_km, transport_time_hours, cold_chain_capable
+FROM routes
+ORDER BY origin_facility_id, destination_facility_id
 """
 
 
@@ -203,6 +224,45 @@ class MySQLDataSource:
             consumption_rows=consumption_rows,
         )
 
+    def regional_store_for(self, medicine_ids: Sequence[str]) -> SimulatedDataStore:
+        """Load the regional state the Ripple Simulator needs, over one read-only connection.
+
+        The scenario medicine is the first ID in medicine_ids that exists. The store holds every facility's
+        inventory, safety stock, replenishments and consumption for that medicine, the whole medicine catalogue
+        (so other requested IDs can be checked for exact identity), cold-chain flags and all routes.
+        """
+        history_start = self.as_of - timedelta(days=self.history_days)
+        with self._connect() as run:
+            medicine_rows = run(SIMULATION_MEDICINES_SQL, ())
+            facility_rows = run(SIMULATION_FACILITIES_SQL, ())
+            requested_id, medicine_row, via_alias = "", None, False
+            for candidate in medicine_ids:
+                medicine_row, via_alias = resolve_medicine(medicine_rows, candidate)
+                if medicine_row is not None:
+                    requested_id = candidate
+                    break
+            if medicine_row is None:
+                inventory_rows, safety_rows, replenishment_rows, consumption_rows, route_rows = [], [], [], [], []
+            else:
+                key = (medicine_row["medicine_id"],)
+                inventory_rows = run(INVENTORY_SQL, key)
+                safety_rows = run(SAFETY_STOCK_SQL, key)
+                replenishment_rows = run(REPLENISHMENTS_SQL, key)
+                consumption_rows = run(CONSUMPTION_SQL, (*key, history_start, self.simulation_date))
+                route_rows = run(ROUTES_SQL, ())
+        return self._normalise(
+            requested_medicine_id=requested_id,
+            medicine_row=medicine_row,
+            via_alias=via_alias,
+            facility_rows=facility_rows,
+            inventory_rows=inventory_rows,
+            safety_rows=safety_rows,
+            replenishment_rows=replenishment_rows,
+            consumption_rows=consumption_rows,
+            route_rows=route_rows,
+            catalogue_rows=medicine_rows,
+        )
+
     def _normalise(
         self,
         *,
@@ -214,11 +274,28 @@ class MySQLDataSource:
         safety_rows: Sequence[Row],
         replenishment_rows: Sequence[Row],
         consumption_rows: Sequence[Row],
+        route_rows: Sequence[Row] | None = None,
+        catalogue_rows: Sequence[Row] = (),
     ) -> SimulatedDataStore:
         facilities_by_key = {row["facility_id"]: normalise_facility(row) for row in facility_rows}
         mappings = database_mappings(self.simulation_date, self.as_of)
         medicines: dict[str, Medicine] = {}
         medicine_aliases: dict[str, str] = {}
+        # Simulator only: the whole catalogue and its documented aliases, so every requested ID can be identity-checked.
+        for row in catalogue_rows:
+            catalogue_medicine = normalise_medicine(row)
+            medicines[catalogue_medicine.id] = catalogue_medicine
+        for alias in MEDICINE_ALIASES:
+            alias_row, _ = resolve_medicine(catalogue_rows, alias)
+            if alias_row is not None:
+                medicine_aliases[alias] = str(alias_row["medicine_id"])
+        routes: dict[tuple[str, str], Route] | None = None
+        if route_rows is not None:
+            routes = {}
+            for row in route_rows:
+                route = normalise_route(row, facilities_by_key)
+                routes[(route.origin_id, route.destination_id)] = route
+            mappings.extend(simulation_mappings())
         inventory: dict[tuple[str, str], InventorySnapshot] = {}
         consumption: list[dict[str, Any]] = []
 
@@ -301,6 +378,8 @@ class MySQLDataSource:
             peer_scope=PEERS_ALL_FACILITIES,
             facility_aliases={str(key): facility.id for key, facility in facilities_by_key.items()},
             medicine_aliases=medicine_aliases,
+            # Always passed, so a MySQL store never falls back to the fixture's default routes.
+            routes=routes,
         )
 
 
@@ -412,6 +491,8 @@ def normalise_medicine(row: Row) -> Medicine:
             f"{_plain(row['storage_temp_min_c'], 'medicines.storage_temp_min_c')}-"
             f"{_plain(row['storage_temp_max_c'], 'medicines.storage_temp_max_c')} C"
         ),
+        # Only the simulator's query selects the column; the forecast leaves it unknown.
+        requires_cold_chain=_optional_flag(row, "requires_cold_chain"),
     )
 
 
@@ -429,7 +510,51 @@ def normalise_facility(row: Row) -> Facility:
         remoteness_score=round(raw_remoteness / REMOTENESS_SCALE_MAX, 3),
         protected_days=None,
         source_remoteness_score=raw_remoteness,
+        has_cold_chain=_optional_flag(row, "has_cold_chain"),
     )
+
+
+def normalise_route(row: Row, facilities_by_key: Mapping[Any, Facility]) -> Route:
+    origin = _facility(facilities_by_key, row["origin_facility_id"], "routes")
+    destination = _facility(facilities_by_key, row["destination_facility_id"], "routes")
+    return Route(
+        origin_id=origin.id,
+        destination_id=destination.id,
+        distance_km=_quantity(row["distance_km"], "routes.distance_km"),
+        travel_hours=_quantity(row["transport_time_hours"], "routes.transport_time_hours"),
+        cold_chain_capable=bool(row["cold_chain_capable"]),
+    )
+
+
+def simulation_mappings() -> list[DataMapping]:
+    """Extra interpretation rules the Ripple Simulator uses; PROVISIONAL until reviewed."""
+    return [
+        DataMapping(
+            name="routes",
+            source="routes.distance_km, transport_time_hours, cold_chain_capable",
+            rule=(
+                "A transfer needs a directed route row from donor to recipient; whole days of transport_time_hours are "
+                "subtracted from arrivalDay to get the departure day."
+            ),
+            review_owner="Dhiren and Sahil",
+        ),
+        DataMapping(
+            name="coldChain",
+            source="medicines.requires_cold_chain, routes.cold_chain_capable, facilities.has_cold_chain",
+            rule="A medicine that requires a cold chain can only move on a cold-chain capable route to a facility with cold-chain storage.",
+            review_owner="Aaryan",
+        ),
+        DataMapping(
+            name="donorSafety",
+            source="facility_safety_stock.safety_stock_qty",
+            rule="A donor must stay at or above its recorded safety stock on every day from the departure day to the end of the horizon.",
+            review_owner="Aaryan",
+        ),
+    ]
+
+
+def _optional_flag(row: Row, column: str) -> bool | None:
+    return bool(row[column]) if column in row and row[column] is not None else None
 
 
 def normalise_batch(row: Row) -> Batch:
