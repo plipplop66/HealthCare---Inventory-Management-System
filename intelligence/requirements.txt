@@ -1,0 +1,14 @@
+# MEDRIPPLE intelligence service (AIML Step 1). Python 3.10+.
+# Runtime
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.5
+# MySQL data source (DATA_SOURCE=mysql). cryptography is required for MySQL 8
+# caching_sha2_password authentication.
+PyMySQL==1.2.0
+cryptography==50.0.1
+
+# Tests
+pytest==9.1.1
+# Starlette's TestClient uses httpx2 (plain httpx is deprecated there).
+httpx2==2.12.0

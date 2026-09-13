@@ -18,6 +18,14 @@ function createConfig(environment = process.env) {
     environment: environment.NODE_ENV || 'development',
     host: environment.BACKEND_HOST || '127.0.0.1',
     port: readInteger(environment.BACKEND_PORT, 3001),
+    dataSource: environment.DATA_SOURCE || 'fixture',
+    databaseUrl: environment.DATABASE_URL || '',
+    databaseHost: environment.DATABASE_HOST || '127.0.0.1',
+    databasePort: readInteger(environment.DATABASE_PORT, 3306),
+    databaseName: environment.DATABASE_NAME || 'medripple',
+    databaseUser: environment.DATABASE_USER || 'medripple',
+    databasePassword: environment.DATABASE_PASSWORD || '',
+    simulationDate: environment.SIMULATION_DATE || '2026-09-11',
     corsOrigins: originList,
     intelligenceServiceUrl: (environment.INTELLIGENCE_SERVICE_URL || '').replace(/\/$/, ''),
     intelligenceTimeoutMs: readInteger(environment.INTELLIGENCE_TIMEOUT_MS, 2500)
@@ -25,4 +33,3 @@ function createConfig(environment = process.env) {
 }
 
 module.exports = { createConfig };
-

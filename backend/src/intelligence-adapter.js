@@ -1,5 +1,4 @@
 const { AppError } = require('./errors');
-const { getFacility, medicine, projectFacility } = require('./fixture-store');
 
 function validateIntelligenceResponse(payload) {
   if (!payload || typeof payload !== 'object' || !payload.risk || !payload.forecast) {
@@ -11,35 +10,36 @@ function validateIntelligenceResponse(payload) {
   return payload;
 }
 
-function createFixtureForecast({ facilityId, medicineId, horizonDays }) {
-  const facility = getFacility(facilityId);
-  if (!facility || medicineId !== medicine.id) {
+async function createFallbackForecast({ facilityId, medicineId, horizonDays }, inventoryStore) {
+  const profile = await inventoryStore.getScenarioProfile(facilityId, medicineId);
+  if (!profile) {
     throw new AppError(404, 'FORECAST_TARGET_NOT_FOUND', 'The requested facility or medicine was not found.');
   }
-  const projection = projectFacility(facility);
+  const source = inventoryStore.source === 'MYSQL' ? 'DATABASE_FALLBACK' : 'FIXTURE_FALLBACK';
   return {
     forecast: {
-      dailyDemand: facility.dailyDemand,
-      lowerBound: Math.max(0, facility.dailyDemand - 1),
-      upperBound: facility.dailyDemand + 2,
+      dailyDemand: profile.dailyDemand,
+      lowerBound: Math.max(0, profile.dailyDemand * 0.9),
+      upperBound: profile.dailyDemand * 1.1,
       horizonDays
     },
-    risk: { score: projection.riskScore, label: projection.riskLabel },
-    stockout: { daysRemaining: projection.daysRemaining, projectedWithinHorizon: projection.daysRemaining <= horizonDays },
-    confidence: { label: 'LOW', reason: 'Deterministic fixture fallback; awaiting the tested intelligence service.' },
-    cause: facility.id === 'facility-navjeevan-phc' ? 'SUPPLY_DELAY' : 'INVENTORY_IMBALANCE',
-    explanation: facility.id === 'facility-navjeevan-phc'
+    risk: { score: profile.riskScore, label: profile.riskLabel },
+    stockout: { daysRemaining: profile.daysRemaining, projectedWithinHorizon: profile.daysRemaining <= horizonDays },
+    confidence: { label: 'LOW', reason: 'Deterministic fallback; awaiting the tested intelligence service.' },
+    cause: profile.incomingArrivalDay && profile.incomingArrivalDay > profile.daysRemaining ? 'SUPPLY_DELAY' : 'INVENTORY_IMBALANCE',
+    explanation: profile.incomingArrivalDay && profile.incomingArrivalDay > profile.daysRemaining
       ? 'Simulated stock will deplete before the scheduled replenishment arrives.'
       : 'Simulated coverage is based on effective stock and daily demand.',
-    source: 'FIXTURE_FALLBACK',
+    source,
+    isFallback: true,
     decisionSupportOnly: true
   };
 }
 
-function createIntelligenceAdapter(config) {
+function createIntelligenceAdapter(config, inventoryStore) {
   return {
     async forecast(input) {
-      if (!config.intelligenceServiceUrl) return createFixtureForecast(input);
+      if (!config.intelligenceServiceUrl) return createFallbackForecast(input, inventoryStore);
 
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), config.intelligenceTimeoutMs);
@@ -55,7 +55,7 @@ function createIntelligenceAdapter(config) {
         return { ...payload, source: 'INTELLIGENCE_SERVICE', decisionSupportOnly: true };
       } catch (error) {
         return {
-          ...createFixtureForecast(input),
+          ...(await createFallbackForecast(input, inventoryStore)),
           fallbackReason: error.name === 'AbortError' ? 'INTELLIGENCE_TIMEOUT' : 'INTELLIGENCE_UNAVAILABLE'
         };
       } finally {
@@ -65,5 +65,4 @@ function createIntelligenceAdapter(config) {
   };
 }
 
-module.exports = { createIntelligenceAdapter, validateIntelligenceResponse };
-
+module.exports = { createIntelligenceAdapter, validateIntelligenceResponse, createFallbackForecast };

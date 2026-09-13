@@ -12,7 +12,7 @@ const facilities = [
   {
     id: 'facility-central-store', name: 'Central District Store', type: 'WAREHOUSE', district: 'Medripple District',
     latitude: 18.522, longitude: 73.857, populationServed: 0, remotenessScore: 0.05,
-    effectiveStock: 900, dailyDemand: 20, protectedDays: 14, incomingSupply: 0
+    effectiveStock: 620, dailyDemand: 20, protectedDays: 14, incomingSupply: 0
   },
   {
     id: 'facility-district-hospital', name: 'District Hospital', type: 'DISTRICT_HOSPITAL', district: 'Medripple District',
@@ -176,8 +176,42 @@ function resetFixtureState() {
   plans = new Map();
 }
 
+function getScenarioProfile(facilityId, medicineId) {
+  const facility = getFacility(facilityId);
+  if (!facility || medicineId !== medicine.id) return null;
+  const projection = projectFacility(facility);
+  return {
+    facilityId: facility.id,
+    facilityName: facility.name,
+    medicineId: medicine.id,
+    medicine,
+    effectiveStock: projection.effectiveStock,
+    dailyDemand: projection.dailyDemand,
+    protectedStock: projection.protectedStock,
+    safeSurplus: projection.safeSurplus,
+    daysRemaining: projection.daysRemaining,
+    riskLabel: projection.riskLabel,
+    riskScore: projection.riskScore,
+    hasColdChain: true,
+    requiresColdChain: true,
+    incomingSupply: facility.incomingSupply || 0,
+    incomingArrivalDay: facility.incomingSupplyDay || null
+  };
+}
+
+function listScenarioProfiles(medicineId) {
+  if (medicineId !== medicine.id) return [];
+  return facilities.map((facility) => getScenarioProfile(facility.id, medicineId));
+}
+
+function selectTransferBatch(facilityId, medicineId) {
+  if (medicineId !== medicine.id) return null;
+  const batch = (batchesByFacility[facilityId] || []).find((item) => item.status === 'USABLE');
+  return batch ? { batchId: batch.batchNo, batchNo: batch.batchNo } : null;
+}
+
 module.exports = {
   medicine, getFacility, getInventory, getRoute, listFacilities, listAudits, getPlan,
-  createPlan, approvePlan, projectFacility, resetFixtureState
+  createPlan, approvePlan, projectFacility, resetFixtureState, getScenarioProfile,
+  listScenarioProfiles, selectTransferBatch
 };
-

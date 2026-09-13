@@ -2,12 +2,14 @@ const crypto = require('node:crypto');
 const cors = require('cors');
 const express = require('express');
 const { createApiRouter } = require('./routes');
-const { AppError } = require('./errors');
+const { AppError, asyncHandler } = require('./errors');
 const { createIntelligenceAdapter } = require('./intelligence-adapter');
+const { createInventoryStore } = require('./inventory-store');
 
 function createApp(config) {
   const app = express();
   const allowedOrigins = new Set(config.corsOrigins);
+  const inventoryStore = createInventoryStore(config);
 
   app.disable('x-powered-by');
   app.use((request, response, next) => {
@@ -30,8 +32,14 @@ function createApp(config) {
     next();
   });
 
-  app.get('/health', (request, response) => response.json({ data: { status: 'ok', service: 'medripple-backend', environment: config.environment }, meta: { requestId: response.locals.requestId } }));
-  app.use('/api', createApiRouter({ intelligenceAdapter: createIntelligenceAdapter(config) }));
+  app.get('/health', asyncHandler(async (request, response) => {
+    const database = await inventoryStore.getHealth();
+    response.json({
+      data: { status: 'ok', service: 'medripple-backend', environment: config.environment, dataSource: inventoryStore.source, database },
+      meta: { requestId: response.locals.requestId }
+    });
+  }));
+  app.use('/api', createApiRouter({ intelligenceAdapter: createIntelligenceAdapter(config, inventoryStore), inventoryStore }));
   app.use((request, response, next) => next(new AppError(404, 'NOT_FOUND', 'The requested route does not exist.')));
   app.use((error, request, response, next) => {
     const knownError = error instanceof AppError;
@@ -50,4 +58,3 @@ function createApp(config) {
 }
 
 module.exports = { createApp };
-
