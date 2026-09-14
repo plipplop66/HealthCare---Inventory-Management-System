@@ -70,7 +70,7 @@ $env:DATA_SOURCE = "mysql"; $env:DATABASE_PASSWORD = "medripple_dev_only"
 
 ### How database fields are interpreted
 
-Every MySQL forecast returns these rules in `dataContext.mappings` and `assumptions`. All except `units` are **provisional** until the named owner confirms them.
+Every MySQL forecast returns these rules in `dataContext.mappings` and `assumptions`. `units` is database policy, and `effectiveStock` is approved by Dhiren for the hackathon prototype (`APPROVED_FOR_HACKATHON_PROTOTYPE`). The others are **provisional** until the named owner confirms them.
 
 | Mapping | Rule | Review |
 | --- | --- | --- |
@@ -322,6 +322,7 @@ A storage facility (warehouse) without consumption records is projected with zer
 | `DONOR_BECOMES_CRITICAL` | The donor's risk label is CRITICAL with the transfers |
 | `CREATES_REGIONAL_SHORTAGE` | The donor gains a stockout, more shortage days or more unmet demand |
 | `ARRIVES_AFTER_RECIPIENT_STOCKOUT` | Without this transfer the recipient runs out before `arrivalDay` |
+| `TRAVEL_TIME_LIMIT_EXCEEDED` | The route takes longer than `OptimizerConfig.max_travel_hours` (6 hours), the same limit `POST /plans/optimize` applies. A route of exactly 6 hours is allowed |
 
 A recipient that is already critical is never a reason to reject; helping it is the purpose.
 
@@ -331,7 +332,7 @@ A recipient that is already critical is never a reason to reject; helping it is 
 
 - Fixture mode uses only the offline fixture, including the three routes of `backend/src/fixture-store.js`; database IDs are not found. MySQL mode uses only the database; fixture facility IDs are not found. The documented alias `med-insulin-100iu-vial` still resolves to Human Insulin.
 - Quantities stay in the medicine's base unit (`mg`, `mL`, `count`, or `vial` for the fixture) with their decimals.
-- MySQL mode uses `facility_safety_stock`, `routes` (distance, travel time, cold chain), `medicines.requires_cold_chain`, `facilities.has_cold_chain`, and `SCHEDULED` / `DELAYED` replenishments. Expired, quarantined and reserved stock is excluded. These rules are returned in `dataContext.mappings` as provisional (`routes`, `coldChain`, `donorSafety` for Aaryan, Dhiren and Sahil to confirm).
+- MySQL mode uses `facility_safety_stock`, `routes` (distance, travel time, cold chain), `medicines.requires_cold_chain`, `facilities.has_cold_chain`, and `SCHEDULED` / `DELAYED` replenishments. Expired, quarantined and reserved stock is excluded. These rules are returned in `dataContext.mappings`: `coldChain` is approved by Aaryan for the hackathon prototype, while `routes` and `donorSafety` stay provisional for Aaryan, Dhiren and Sahil to confirm.
 
 ### Read-only guarantee
 
@@ -348,7 +349,9 @@ The simulator only reads. The MySQL session is opened with `SET SESSION TRANSACT
 
 ## Transfer optimizer: `POST /plans/optimize`
 
-> **Simulated decision support only.** All data is simulated. A plan is a proposal: a qualified person must review and approve it before any stock moves. The optimizer never substitutes one medicine for another, never writes a transfer and never changes inventory. Objective weights and the equity rule are **prototype assumptions, not clinically validated**, and await Aaryan's review.
+> **Simulated decision support only.** All data is simulated. A plan is a proposal: a qualified person must review and approve it before any stock moves. The optimizer never substitutes one medicine for another, never writes a transfer and never changes inventory.
+>
+> The objective order, equity guardrail, donor exclusions, six-hour route cap and received-stock-only donor rule were accepted in the biomedical (Aaryan) and database (Dhiren) reviews **for this hackathon prototype only**. They are not clinically validated; real deployment requires clinical, regulatory and operational validation.
 
 Given a destination, one exact medicine, a quantity and a horizon, the optimizer proposes the smallest safe redistribution plan, from one or more donors. It uses Google OR-Tools CP-SAT for the allocation and the Ripple Simulator as the final safety check: a plan is returned only after the simulator evaluates the complete plan and marks it safe. It is not connected to the Node `/api/plans/optimize` route yet; see [Backend changes requested](#backend-changes-requested).
 
@@ -382,10 +385,10 @@ The same shape the Node backend accepts (`validateOptimizeRequest` in `backend/s
 
 1. **Load one read-only snapshot.** The same regional store as the simulator, over one read-only MySQL connection (or the in-memory fixture).
 2. **Project every facility** with the simulator's `load_facility_state` and `baseline_outcome`, which reuse `POST /forecast` (weighted moving average, day-by-day projection with scheduled and delayed replenishments, protected stock, risk).
-3. **Filter candidates** with hard rules (below). Route, cold-chain, identity, data and timing checks call the simulator's own feasibility gate, so both give the same reasons.
-4. **Work out each donor's safe capacity** and confirm it with the Ripple Simulator: sending the full capacity must be eligible and create no new risk at that donor.
+3. **Filter candidates** with hard rules (below), including the six-hour route cap. Route, cold-chain, identity, data and timing checks call the simulator's own feasibility gate, so both give the same reasons.
+4. **Work out each donor's safe capacity** from stock already received, never future deliveries, and confirm it with the Ripple Simulator: sending the full capacity must be eligible and create no new risk at that donor.
 5. **Allocate** donors, batches and arrival days with CP-SAT.
-6. **Validate** the complete plan in the Ripple Simulator. If it fails, the donors the simulator rejected are excluded (or, when no donor is to blame, that donor combination is forbidden) and the model is solved again, up to 5 attempts. Otherwise the result is `NO_SAFE_PLAN`.
+6. **Validate** the complete plan in the Ripple Simulator, and re-check the route cap and received-stock donor safety. If it fails, the donors the simulator rejected are excluded (or, when no donor is to blame, that donor combination is forbidden) and the model is solved again, up to 5 attempts. Otherwise the result is `NO_SAFE_PLAN`.
 
 ### Candidate filtering
 
@@ -396,6 +399,7 @@ The same shape the Node backend accepts (`validateOptimizeRequest` in `backend/s
 | `NO_EFFECTIVE_STOCK`, `NO_USABLE_BATCH` | It has no usable stock; expired, quarantined and reserved stock never counts |
 | `BATCH_EXPIRES_BEFORE_USE` | None of its usable batches stays in date until the end of the horizon |
 | `ROUTE_NOT_FOUND`, `COLD_CHAIN_UNAVAILABLE`, `INCOMPLETE_DATA`, `ARRIVAL_OUTSIDE_HORIZON` | The simulator's gate: no directed route, no cold chain on the route or at the destination, missing data, or it cannot arrive within the horizon |
+| `TRAVEL_TIME_LIMIT_EXCEEDED` | Its route to the destination takes longer than `maxTravelHours` (6 hours by default; exactly 6 is allowed). The reason names the donor, the actual travel time and the limit |
 | `ARRIVES_AFTER_RECIPIENT_STOCKOUT` | Its earliest delivery arrives after the destination's projected stockout day |
 | `SAFETY_STOCK_NOT_RECORDED` | A clinical facility without recorded safety stock, so no safe capacity can be established |
 | `DONOR_AT_RISK` | It is already `HIGH` or `CRITICAL` risk without any transfer |
@@ -412,14 +416,34 @@ For each arrival day in the useful window (from the route's earliest arrival to 
 ```
 departure day  = arrival day - whole days of route travel time
 safe capacity  = min( opening stock on the departure day,
-                      lowest projected closing stock from the departure day to the horizon end - retained floor,
+                      lowest received-stock projection from the departure day to the horizon end - retained floor,
                       usable batches that stay in date until the horizon end,
                       safe surplus at the snapshot - 0.01 )
 ```
 
-The projection already contains forecast consumption and scheduled or delayed replenishments, so capacity is **not** `effective stock - protected stock`. A hospital with 1000 mL, 50 mL/day and 700 mL safety stock looks like it has 300 mL to spare, but its projected stock reaches 700 mL on day 6, so its safe capacity is 0. The last term keeps every donor's safe surplus positive, so no other facility's regional fragility rises. Capacities are rounded **down** to the hundredth (or whole unit).
+**Donors count only stock already received.** The received-stock projection is the normal day-by-day projection (`project_stock`: forecast consumption, stock floored at zero) with **no** `SCHEDULED`, `DELAYED` or other future replenishment.
+- **No future stock for donors.** A delivery that has not arrived can never make a donor eligible or increase what it may send.
+- **No double counting.** `ARRIVED` stock is already in inventory and is never added again.
+- **Visible exclusions.** Each candidate reports the left-out supply in `futureReplenishmentExcluded`, and its explanation names the orders.
+- **Recipients unchanged.** The recipient's projection, `POST /forecast` and the Ripple Simulator still count scheduled and delayed replenishments.
 
-### Equity guardrail (provisional, for Aaryan to approve)
+Capacity is therefore **not** `effective stock - protected stock`. A hospital with 1000 mL, 50 mL/day and 700 mL safety stock looks like it has 300 mL to spare, but without its 700 mL delivery on day 7 its stock falls to 300 mL by day 14, so its safe capacity is 0. The last term keeps every donor's safe surplus positive, so no other facility's regional fragility rises. Capacities are rounded **down** to the hundredth (or whole unit).
+
+### Donor guardrails (approved for the hackathon prototype)
+
+These values were accepted in Aaryan's biomedical review for this hackathon prototype only (`status: APPROVED_FOR_HACKATHON_PROTOTYPE`). They are not clinically validated. All are configurable in `OptimizerConfig` (`app/optimizer.py`) and returned in `equityGuardrail`, `assumptions` and `dataContext.mappings`.
+
+**Six-hour route cap.**
+- A donor's route to the destination may take at most `maxTravelHours`, 6 hours by default; a route of exactly 6 hours is allowed.
+- A longer route is rejected with `TRAVEL_TIME_LIMIT_EXCEEDED`, and the reason names the donor, the actual hours and the limit.
+- A missing route is rejected (`ROUTE_NOT_FOUND`), never assumed safe.
+- The cap is re-checked on the final plan (`ROUTES_WITHIN_TRAVEL_LIMIT`).
+- It does not change how departure and arrival days are calculated.
+- `POST /scenarios/simulate` applies the same configured cap. A longer route is still simulated, so its effect on stock stays visible, but the transfer is ineligible (`TRAVEL_TIME_LIMIT_EXCEEDED`) and `safeToRecommend` is false.
+
+**Donor exclusions.** Facilities already `HIGH` or `CRITICAL` never donate.
+
+**Equity and warehouse reserve.**
 
 ```
 retained floor      = max( protected stock x (1 + equity uplift), operational reserve )
@@ -441,7 +465,7 @@ With the seed data this means a donor keeps, on every day from departure to the 
 - `SC-RMD-001` (7.8): 174%.
 - `WH-TN-001`, which has no safety stock row: 10% of its usable stock.
 
-The rule and its parameters are configurable in `OptimizerConfig` (`app/optimizer.py`), returned in `equityGuardrail` and `assumptions`, and marked `PROVISIONAL`. They are not clinically validated.
+Remoteness is still the stored `remoteness_score` (MySQL 0-10, divided by 10) with the 0.5 weight. A travel-time-derived remoteness is deferred; see [Deferred decisions](#deferred-decisions).
 
 ### Solver, decision variables and quantity scaling
 
@@ -456,7 +480,7 @@ The rule and its parameters are configurable in `OptimizerConfig` (`app/optimize
 - whether each batch is used;
 - which single arrival day the donor delivers on;
 - the quantity arriving that day;
-- the per mille of that day's safe capacity used.
+- the parts per million of that day's safe capacity used (rounded up).
 
 The destination's daily stock, unmet demand and shortage days are modelled exactly as `app/stock_projection.py` projects them.
 
@@ -475,16 +499,16 @@ Priorities 1 (no new stockout) and 2 (full quantity) are hard constraints. The r
 | Stage | Priorities | Minimised value | Weights |
 | --- | --- | --- | --- |
 | 1 `RECIPIENT_SHORTAGE` | 3 unmet demand, 4 shortage days | `31 x recipient unmet demand (hundredths) + 1 x shortage days` | 31 exceeds the 30 possible shortage days, so less unmet demand always wins |
-| 2 `DONOR_PROTECTION` | 5 donor safety-stock preservation, 6 equity impact | `sum over donors of headroom used (per mille of safe capacity) x (100 + equity index)` | 100 per mille of headroom, plus the equity index `round(100 x equity uplift)` (0-85), so remote donors cost up to 1.85x as much |
+| 2 `DONOR_PROTECTION` | 5 donor safety-stock preservation, 6 equity impact | `sum over donors of headroom used (parts per million of safe capacity, rounded up) x (100 + equity index)` | 100 per part per million of headroom, plus the equity index `round(100 x equity uplift)` (0-85), so remote donors cost up to 1.85x as much |
 | 3 `LOGISTICS` | 7 arrival, 8 distance, 9 transfers | `10^10 x arrival days + 1000 x distance (0.1 km) + 1 x (donors + transfer instructions)` | Each weight exceeds the largest possible total of the terms after it (at most 999 donors plus batches, at most 9,999,999 tenths of a km) |
 
 Regional unmet demand and shortage days can only change at the destination, because donors are not allowed any new shortage, so stage 1 measures the destination. `solver.objectiveValue` is the stage 1 value; every stage's value, status and weights are in `solver.objectiveStages`. There is no "AI confidence": `solver.status` is `OPTIMAL` or `FEASIBLE` for a returned plan, and `INFEASIBLE` or `VALIDATION_FAILED` in `NO_SAFE_PLAN`.
 
 ### FEFO batch allocation
 
-Only usable batches count: `AVAILABLE` inventory, not quarantined, in date on day 1, and in date until the end of the horizon. They are used earliest expiry first, then by batch number. A later batch is used only when every earlier one is fully allocated, and a donor's allocation is split across batches when needed.
+Only usable batches count: `AVAILABLE` inventory, not quarantined, in date on day 1, and in date until the end of the horizon. They are used earliest expiry first, then by `batches.batch_id` (by batch number only in the fixture, which has no batch IDs). The simulator uses the same order. A later batch is used only when every earlier one is fully allocated, and a donor's allocation is split across batches when needed.
 
-Each batch becomes a **separate transfer instruction** with `batchId` (`batches.batch_id`) and `batchNo`, because Node persists one `transfers` row per batch. The fixture has no database batch IDs, so `batchId` is the batch number there, as in `backend/src/fixture-store.js`.
+Each batch becomes a **separate transfer instruction** with `batchId` (`batches.batch_id`) and `batchNo`, because Node persists one `transfers` row per batch. The fixture has no database batch IDs, so `batchId` is the batch number there, as in `backend/src/fixture-store.js`. Dhiren approved this batch interpretation for the hackathon prototype (`batchIdentity`); persisting it in `transfers` is still Sahil's pending Node work.
 
 ### Simulator validation
 
@@ -499,6 +523,8 @@ The complete plan is sent to `simulate()` as transfer requests in batch order. I
 | `REQUESTED_QUANTITY_SUPPLIED` | Allocated and simulated arrivals equal the request exactly |
 | `REGIONAL_SHORTAGE_NOT_WORSE` | Regional outcome `IMPROVED` or `UNCHANGED` |
 | `BATCH_ALLOCATION_MATCHES` | The simulator allocated exactly the planned batches and quantities |
+| `ROUTES_WITHIN_TRAVEL_LIMIT` | Every donor route takes at most `maxTravelHours` (the candidate rule, applied again) |
+| `DONORS_SAFE_WITHOUT_FUTURE_SUPPLY` | Projected from stock already received, with its whole transfer on its departure day, every donor keeps its retained floor |
 | `SAFE_TO_RECOMMEND` | The simulator's `safeToRecommend` is true |
 
 The optimizer never declares its own result safe.
@@ -513,13 +539,13 @@ Node-compatible plan fields are `id`, `status` (`PROPOSED`), `medicine`, `destin
 | `solver` | `name` (`OR-Tools`), `algorithm` (`CP-SAT`), `version`, `status`, `quantityScale`, `objectiveValue`, `objectiveStages[]`, `attempts`, `hardConstraints[]` |
 | `transfers[]` | `fromFacilityId`, `toFacilityId`, `medicineId`, `batchId`, `batchNo`, `expiryDate`, `quantity`, `unit`, `departureDay`, `arrivalDay`, `arrivalDate`, `distanceKm`, `travelHours`, `coldChainAvailable` (and facility names) |
 | `recipient` | Stockout day, shortage days and unmet demand before and after, `stockoutPrevented`, and `quantityToAvoidShortage` (the day-1 quantity that removes the projected shortage) |
-| `candidates[]` | Every facility with `status` (`SELECTED`, `ELIGIBLE_NOT_SELECTED`, `REJECTED`), `rejectionCodes`/`rejectionReasons`, stock, demand, protected stock, `equityUplift`, `equityReserve`, `operationalReserve`, `retainedFloor`, `safeCapacity`, `allocatedQuantity`, route and a plain-language `explanation` |
-| `equityGuardrail` | Formula, parameters, `PROVISIONAL`, review owner |
+| `candidates[]` | Every facility with `status` (`SELECTED`, `ELIGIBLE_NOT_SELECTED`, `REJECTED`), `rejectionCodes`/`rejectionReasons`, stock, demand, protected stock, `equityUplift`, `equityReserve`, `operationalReserve`, `retainedFloor`, `futureReplenishmentExcluded`, `safeCapacity`, `allocatedQuantity`, route and a plain-language `explanation` |
+| `equityGuardrail` | The donor guardrails in effect: equity formula and uplifts, `maxTravelHours`, `donorCapacityBasis` (`RECEIVED_STOCK_ONLY`), excluded risk labels, `status` (`APPROVED_FOR_HACKATHON_PROTOTYPE`), `reviewOwner` and `validationNote`. Also returned in the `NO_SAFE_PLAN` details |
 | `validation` | Validator version, `passed`, `checks[]` |
 | `simulation` | The full `POST /scenarios/simulate` response for the plan |
 | `limitations`, `requiresHumanApproval` (always `true`), `dataContext` (with `equityReserve`, `batchIdentity` and `quantityScale` mappings), `dataLabel`, `modelVersion` | |
 
-**Plan ID.** `id` is `plan-` followed by the first 32 hex digits of a SHA-256 digest. The digest covers the destination, medicine, requested quantity, horizon, the normalised transfers (donor, batch, quantity, departure and arrival day) and the data context (source, simulation date, as-of date). An identical request on unchanged data always returns the same ID. No clock, UUID or random number is used.
+**Plan ID.** `id` is `plan-` followed by the first 32 hex digits of a SHA-256 digest. The digest covers the destination, medicine, requested quantity, horizon, the normalised transfers (donor, batch, quantity, departure and arrival day) and the data context (source, simulation date, as-of date). An identical request on unchanged data always returns the same ID. No clock, UUID or random number is used. **This ID is authoritative:** Sahil's Node backend must persist the `id` returned here and must not generate a second one.
 
 ### No safe plan
 
@@ -529,7 +555,7 @@ Node-compatible plan fields are `id`, `status` (`PROPOSED`), `medicine`, `destin
     "code": "NO_SAFE_PLAN",
     "message": "No safe regional redistribution plan can satisfy the requested quantity.",
     "details": {
-      "requestedQuantity": 100000, "safeCapacity": 4501.63, "unmetQuantity": 95498.37, "unit": "mL",
+      "requestedQuantity": 100000, "safeCapacity": 4500, "unmetQuantity": 95500, "unit": "mL",
       "solverStatus": "INFEASIBLE", "attempts": 1, "candidatesConsidered": 4,
       "eligibleCandidates": [ ... ], "rejectedCandidates": [ ... ],
       "recommendedEscalation": [ "Ask the supplier to expedite the delayed replenishment ...", "..." ],
@@ -559,14 +585,68 @@ The optimizer only reads. It uses the simulator's regional store (MySQL: `SET SE
 - the fixture store, forecasts and simulator output are unchanged after optimising;
 - (live) row counts, quantity totals and `CHECKSUM TABLE` of `inventory`, `batches`, `transfers` and `audit_events` are unchanged.
 
+### Exact medicine identity
+
+A different medicine, strength or dosage form is always rejected.
+- **Simulator:** `MEDICINE_IDENTITY_MISMATCH`.
+- **Optimizer:** only facilities holding the exact medicine are candidates; any other facility gets `NO_INVENTORY_RECORD`.
+
+No request field can override this: extra fields such as an emergency or branch-manager flag are ignored, and tests check that they change nothing. The rejection recommends manual pharmacist or qualified clinical review, but the transfer stays rejected.
+
+### Fields for the UI
+
+Where each item Samson's UI needs already appears (no duplicate fields were added):
+
+| Item | `POST /forecast` | `POST /scenarios/simulate` | `POST /plans/optimize` |
+| --- | --- | --- | --- |
+| Current effective stock | `inventory.effectiveStock` | `baseline.facilities[].effectiveStock` | `recipient.effectiveStock`, `candidates[].effectiveStock` |
+| Daily demand (depletion rate) | `forecast.dailyDemand` | `facilities[].predictedDailyDemand` | `recipient.predictedDailyDemand`, `candidates[].predictedDailyDemand` |
+| Risk score and label | `risk.score`, `risk.label` | `facilities[].riskScore`, `riskLabel` | `candidates[].baselineRiskScore`, `baselineRiskLabel`; after the plan `simulation.intervention.facilities[].riskScore`, `riskLabel` |
+| Stockout day and date | `stockout.projectedStockoutDay`, `projectedStockoutDate` | `facilities[].stockoutDay`, `stockoutDate` | `recipient.stockoutDayBefore`, `stockoutDayAfter`; dates in `simulation.baseline` / `simulation.intervention` `.facilities[].stockoutDate` |
+| Donor retained floor | - | - | `candidates[].retainedFloor` |
+| Safe donor capacity | - | - | `candidates[].safeCapacity`; `NO_SAFE_PLAN` `details.safeCapacity` |
+| Future supply left out of donor capacity | - | - | `candidates[].futureReplenishmentExcluded` |
+| Route travel time and limit | - | `transferEvaluations[].route.travelHours` | `transfers[].travelHours`, `candidates[].travelHours`, `equityGuardrail.maxTravelHours` |
+| Batch ID and batch number | - | `transferEvaluations[].batches[].batchNo` | `transfers[].batchId`, `transfers[].batchNo` |
+| Rejection code and reason | - | `transferEvaluations[].rejectionCodes`, `rejectionReasons` | `candidates[].rejectionCodes`, `rejectionReasons`; `NO_SAFE_PLAN` `details.rejectedCandidates[]` |
+| Shortage days prevented | - | `comparison.shortageDaysPrevented` | `simulation.comparison.shortageDaysPrevented` |
+| Unmet demand reduced | - | `comparison.unmetDemandReduced` | `simulation.comparison.unmetDemandReduced` |
+| Facilities protected | - | `comparison.recipientOutcomes[].stockoutPrevented`, `comparison.improvedFacilities[]` | `recipient.stockoutPrevented`, `simulation.comparison.improvedFacilities[]` |
+| Safe to recommend | - | `comparison.safeToRecommend` | `simulation.comparison.safeToRecommend`, `validation.passed` |
+| Human approval required | `decisionSupportOnly` | `decisionSupportOnly` | `requiresHumanApproval`, `decisionSupportOnly` |
+
+**No patient-days-at-risk.** No response from this service calculates or exposes patient-days at risk or any other patient-impact metric; Aaryan rejected it as not clinically validated. The simulator and optimizer state this in `limitations`. The Node backend's own `patientDaysAtRisk` is outside this service.
+
+### Deferred decisions
+
+These review suggestions are **not implemented**. The prototype lacks the secure data, authorization design or agreed definitions they need.
+
+| Suggestion | Why it is deferred |
+| --- | --- |
+| Remoteness derived from travel time | The review does not define the reference facility (nearest hospital, warehouse, district hospital or another). The stored `remoteness_score` and the 0.5 weight stay. |
+| Emergency warehouse reserve of 5% instead of 10% | Needs authenticated Regional Manager authorization, emergency declaration data, attached reports and audit handling in Node/MySQL. A client-supplied flag is never trusted. |
+| Outbreak exception letting `HIGH`/`CRITICAL` donors give 2% | Not clinically validated, and needs an authenticated outbreak declaration and senior approval. `HIGH`/`CRITICAL` donors stay fully excluded. |
+| Urgency defined as less than 5% of stock remaining | Ambiguous, and it does not change the approved objective order or the route cap. The existing risk and stockout logic stays. |
+| Vehicle and destination storage capacity, temperature logs, transport cost, supplier reliability, route-validity dates | No data yet; listed in `limitations`. |
+| Plans table, transfer persistence, inventory reservation, approval transactions, locking, audit events, `409 PLAN_STOCK_CHANGED` | Belong to Sahil's Node backend and Dhiren's database; this service stays read-only. |
+
 ### Assumptions and limitations
 
 Returned with every plan in `assumptions` and `limitations`. The main ones:
 
 - All data is simulated; results are decision support and require human approval; there is no clinical substitution.
-- Objective weights, the equity uplifts, the 10% warehouse reserve and excluding `HIGH`/`CRITICAL` donors are prototype assumptions for Aaryan to review.
+- **Prototype-only approval.** These rules are approved for this hackathon prototype only:
+  - the objective order;
+  - the equity uplifts and the 0.5 remoteness weight;
+  - the 10% warehouse reserve;
+  - the `HIGH`/`CRITICAL` donor exclusion;
+  - the six-hour route cap;
+  - received-stock-only donor capacity.
+
+  They are not clinically validated; real deployment requires clinical, regulatory and operational validation.
+- **No patient-impact metric.** Patient impact is not calculated by this prototype, and there is no patient-days-at-risk metric; only a qualified clinical or public-health assessment could estimate this.
 - A donor's own dispensing is assumed not to use the batches chosen for transfer. Expiry is handled only by sending batches that stay in date until the end of the horizon.
-- Vehicle capacity, cost, transport losses and the destination's storage capacity are not modelled.
+- Vehicle and destination storage capacity, temperature logs, transport cost, transport losses and route-validity dates are not modelled.
 - Replenishment stock arriving during the horizon has no batch, so it is not sent onward.
 - A slower donor that could only help in combination with a faster one, after the destination's projected stockout begins, is not considered.
 - Supplier reliability is not used.
@@ -574,9 +654,15 @@ Returned with every plan in `assumptions` and `limitations`. The main ones:
 
 ### Tests
 
-`tests/test_optimizer.py` covers optimizer scenarios, and `tests/test_optimizer_api.py` covers the API contract. Both run on in-memory rows (`tests/optimizer_support.py`), the fixture and the CP-SAT model directly. `tests/test_optimizer_live.py` runs against the seeded database only when `MEDRIPPLE_LIVE_MYSQL=1`:
+The optimizer test modules:
+- `tests/test_optimizer.py`: optimizer scenarios.
+- `tests/test_optimizer_api.py`: the API contract.
+- `tests/test_optimizer_review_rules.py`: the reviewed rules, namely the six-hour cap (in the optimizer and the Ripple Simulator, from one configured value), FEFO tie-breaking by batch ID, received-stock-only donors, approved guardrail values, exact identity, cold chain, `NO_SAFE_PLAN`, determinism and the absence of a patient-impact metric.
+
+All three run on in-memory rows (`tests/optimizer_support.py`), the fixture and the CP-SAT model directly. `tests/test_optimizer_live.py` runs against the seeded database only when `MEDRIPPLE_LIVE_MYSQL=1`. It covers the Vellore plan, database batches, the route cap on real routes and future supply matching the database:
 
 ```powershell
+.\.venv\Scripts\python -m pytest tests/test_optimizer_review_rules.py
 .\.venv\Scripts\python -m pytest tests/test_optimizer.py tests/test_optimizer_api.py
 $env:MEDRIPPLE_LIVE_MYSQL = "1"; $env:DATABASE_PORT = "3307"; $env:DATABASE_PASSWORD = "medripple_dev_only"
 .\.venv\Scripts\python -m pytest tests/test_optimizer_live.py
@@ -691,6 +777,17 @@ The MySQL seed (10 facilities, 12 medicines, 75 days of consumption) is now read
 - Final `analyse_shortage` input field names aligned with the database columns
 - Team confirmation of the provisional mappings in [How database fields are interpreted](#how-database-fields-are-interpreted)
 
+### Demo data limitations for the optimizer
+
+With the six-hour route cap and received-stock-only donor capacity, the seed supports few safe plans. On the 14-day horizon only `WH-TN-001` has safe donor capacity for insulin, and it is within six hours only of `PHC-VLR-001` (3.19 h). Most other destinations therefore return `NO_SAFE_PLAN`: their donors are too far away, lack a cold chain, or are safe only because of scheduled deliveries.
+
+This is the intended result on this data. The rules are not relaxed and the service never edits the data to produce more plans. Dhiren owns the follow-up seed additions:
+- one more donor route under six hours;
+- a clinical donor that stays safe without any incoming replenishment;
+- a valid two-donor scenario;
+- a deliberately unsafe donor;
+- a cold-chain failure.
+
 ## Node backend integration
 
 The Express API now proxies `/forecast` and `/scenarios/simulate` to this service when `INTELLIGENCE_SERVICE_URL` is configured. It passes deliberate 4xx intelligence errors through to callers and uses its own simulator only when the service times out or is unavailable. `optimisePlan` keeps its database-selected `batchId` for approval persistence, then evaluates the selected transfers through this service when available.
@@ -720,7 +817,7 @@ tests/                   pytest suite: fixture API and engine, MySQL store, simu
 ## Not implemented yet
 
 - **Node integration and frontend.** The Node backend does not call `POST /scenarios/simulate` or `POST /plans/optimize` yet (see [Backend changes requested](#backend-changes-requested)), and there is no frontend work here.
-- **Unreviewed prototype rules.** The optimizer's objective weights and equity guardrail await Aaryan's review.
+- **Prototype-only rules.** The optimizer's guardrails are approved for the hackathon prototype only, not clinically validated. Emergency and outbreak exceptions and travel-time-derived remoteness are deferred; see [Deferred decisions](#deferred-decisions).
 - **Not modelled:**
   - batch expiry during the horizon (no simulated batch expires within 30 days of the snapshot), and donors dispensing from the batches chosen for transfer;
   - vehicle and storage capacity;
