@@ -176,12 +176,17 @@ def test_plan_response_contract_for_node(client):
             "distanceKm", "travelHours"} <= body["transfers"][0].keys()
     assert body["simulation"]["scenarioType"] == "SIMULATED_DATABASE"
     assert (body["dataContext"]["dataSource"], body["dataContext"]["simulationDate"]) == ("MYSQL", "2026-09-11")
-    assert {"equityReserve", "batchIdentity", "quantityScale", "routes", "coldChain"} <= {item["name"] for item in body["dataContext"]["mappings"]}
-    assert body["equityGuardrail"]["status"] == "PROVISIONAL" and body["equityGuardrail"]["reviewOwner"] == "Aaryan"
+    mapping_names = {item["name"] for item in body["dataContext"]["mappings"]}
+    assert {"equityReserve", "travelTimeLimit", "donorReceivedStockOnly", "batchIdentity", "quantityScale", "routes", "coldChain"} <= mapping_names
+    guardrail = body["equityGuardrail"]
+    assert (guardrail["status"], guardrail["reviewOwner"], guardrail["maxTravelHours"], guardrail["donorCapacityBasis"]) == (
+        "APPROVED_FOR_HACKATHON_PROTOTYPE", "Aaryan", 6.0, "RECEIVED_STOCK_ONLY",
+    )
     assumptions = " ".join(body["assumptions"])
-    for phrase in ("simulated", "OR-Tools CP-SAT", "never substitutes", "approve every operational transfer", "hundredths"):
+    for phrase in ("simulated", "OR-Tools CP-SAT", "never substitutes", "approve every operational transfer", "hundredths", "at most 6 hours", "stock already received"):
         assert phrase in assumptions
     assert any("not clinically validated" in item for item in body["limitations"])
+    assert any("clinical, regulatory and operational validation" in item for item in body["limitations"])
     assert any("Nothing is written" in item for item in body["limitations"])
     assert "confidence" not in json.dumps({key: value for key, value in body.items() if key != "simulation"}).lower()
 
@@ -194,7 +199,12 @@ def test_no_safe_plan_contract(client):
             "recommendedEscalation", "explanation", "solverStatus", "attempts", "dataContext"} <= info.keys()
     assert info["solverStatus"] == "INFEASIBLE" and info["decisionSupportOnly"] is True
     rejected = {item["facilityId"]: item["rejectionCodes"] for item in info["rejectedCandidates"]}
-    assert rejected == {"CHC-SIM-001": ["COLD_CHAIN_UNAVAILABLE", "NO_SAFE_DONOR_CAPACITY"], "DH-SIM-001": ["NO_SAFE_DONOR_CAPACITY"]}
+    assert rejected == {
+        "CHC-SIM-001": ["COLD_CHAIN_UNAVAILABLE", "NO_SAFE_DONOR_CAPACITY"],
+        "DH-SIM-001": ["NO_SAFE_DONOR_CAPACITY"],
+        "SC-SIM-001": ["TRAVEL_TIME_LIMIT_EXCEEDED"],
+    }
+    assert info["equityGuardrail"]["maxTravelHours"] == 6.0
     assert "transfers" not in response.json()
 
 
