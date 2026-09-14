@@ -474,7 +474,8 @@ def create_app(
     def simulate_scenario(payload: SimulationRequest) -> SimulationResponse:
         """Ripple Simulator: read-only before/after projection of proposed transfers. Decision support only."""
         store = data_source.regional_store_for([item.medicine_id for item in payload.transfers])
-        return run_simulation(store, payload, risk_config)
+        # The same configured route cap as POST /plans/optimize, so both endpoints agree.
+        return run_simulation(store, payload, risk_config, optimizer_config.max_travel_hours)
 
     @app.exception_handler(OptimizationError)
     async def handle_optimization_error(request: Request, error: OptimizationError) -> JSONResponse:

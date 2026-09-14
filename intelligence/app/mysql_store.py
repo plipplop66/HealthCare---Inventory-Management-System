@@ -21,6 +21,7 @@ from typing import Any
 
 from .config import Settings
 from .data_store import (
+    APPROVED_FOR_HACKATHON_PROTOTYPE,
     HISTORY_DAYS,
     PEERS_ALL_FACILITIES,
     PROTECTED_STOCK_NOT_RECORDED,
@@ -429,6 +430,7 @@ def database_mappings(simulation_date: date, as_of: date) -> list[DataMapping]:
                 "QUARANTINED, EXPIRED and RESERVED stock is recorded but excluded."
             ),
             review_owner="Dhiren",
+            status=APPROVED_FOR_HACKATHON_PROTOTYPE,
         ),
         DataMapping(
             name="replenishments",
@@ -527,7 +529,7 @@ def normalise_route(row: Row, facilities_by_key: Mapping[Any, Facility]) -> Rout
 
 
 def simulation_mappings() -> list[DataMapping]:
-    """Extra interpretation rules the Ripple Simulator uses; PROVISIONAL until reviewed."""
+    """Extra interpretation rules the Ripple Simulator uses; coldChain is approved for the prototype, the others stay PROVISIONAL."""
     return [
         DataMapping(
             name="routes",
@@ -543,6 +545,7 @@ def simulation_mappings() -> list[DataMapping]:
             source="medicines.requires_cold_chain, routes.cold_chain_capable, facilities.has_cold_chain",
             rule="A medicine that requires a cold chain can only move on a cold-chain capable route to a facility with cold-chain storage.",
             review_owner="Aaryan",
+            status=APPROVED_FOR_HACKATHON_PROTOTYPE,
         ),
         DataMapping(
             name="donorSafety",

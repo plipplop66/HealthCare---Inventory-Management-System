@@ -173,7 +173,7 @@ class DataMappingBlock(ApiModel):
     name: str
     source: str
     rule: str
-    status: Literal["PROVISIONAL", "DATABASE_POLICY"]
+    status: Literal["PROVISIONAL", "DATABASE_POLICY", "APPROVED_FOR_HACKATHON_PROTOTYPE"]
     review_owner: str
 
 
@@ -551,6 +551,9 @@ class CandidateBlock(ApiModel):
     operational_reserve: float | None = Field(description="Storage facilities only: share of effective stock kept for regional supply.")
     retained_floor: float | None = Field(description="Stock the donor must keep on every day from departure to the end of the horizon.")
     lasting_batch_quantity: float = Field(description="Usable stock in batches that stay in date until the end of the horizon.")
+    future_replenishment_excluded: float = Field(
+        description="Scheduled or delayed stock due within the horizon that is deliberately not counted toward donor capacity."
+    )
     safe_capacity: float
     allocated_quantity: float
     baseline_risk_score: int | None
@@ -562,14 +565,21 @@ class CandidateBlock(ApiModel):
 
 
 class EquityGuardrailBlock(ApiModel):
+    """The donor guardrails in effect (OptimizerConfig), so a client can explain every donor rejection."""
+
     formula: str
     remoteness_weight: float
     facility_type_uplift: dict[str, float]
     default_type_uplift: float
     warehouse_operational_reserve_share: float
     excluded_donor_risk_labels: list[str]
-    status: Literal["PROVISIONAL"]
+    max_travel_hours: float = Field(description="Longest donor route allowed; a longer route is rejected with TRAVEL_TIME_LIMIT_EXCEEDED.")
+    donor_capacity_basis: Literal["RECEIVED_STOCK_ONLY"] = Field(
+        description="Donor capacity counts only stock already received; scheduled, delayed and other future deliveries never add to it."
+    )
+    status: Literal["APPROVED_FOR_HACKATHON_PROTOTYPE"]
     review_owner: str
+    validation_note: str
 
 
 class ValidationCheckBlock(ApiModel):
@@ -644,6 +654,7 @@ class NoSafePlanDetailsBlock(ApiModel):
     rejected_candidates: list[CandidateBlock]
     recommended_escalation: list[str]
     explanation: str
+    equity_guardrail: EquityGuardrailBlock = Field(description="The donor guardrails that were applied, including the travel-time limit.")
     decision_support_only: Literal[True] = True
     data_context: SimulationDataContextBlock
 
