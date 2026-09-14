@@ -16,17 +16,27 @@ from app.simulator import INVALID_ARRIVAL_DAY, INVALID_QUANTITY, ProposedTransfe
 from tests.simulator_support import (
     CONSUMPTION_ROWS,
     INVENTORY_ROWS,
+    PHC,
+    ROUTE_ROWS,
     SETTINGS,
     SUBCENTRE,
     FakeDatabase,
     facility,
     inventory_row,
     mysql_client,
+    route_row,
     simulate,
     transfer,
 )
 
 FIXTURE_INSULIN = "med-insulin-100iu-vial"
+
+
+def subcentre_route_within_limit():
+    """The routes with the subcentre's 7.6-hour route to PHC-SIM-001 shortened to 5.5 hours, inside the 6-hour cap."""
+    return [row for row in ROUTE_ROWS if (row["origin_facility_id"], row["destination_facility_id"]) != (SUBCENTRE, PHC)] + [
+        route_row(SUBCENTRE, PHC, "310.00", "5.50", True)
+    ]
 
 
 @pytest.fixture()
@@ -165,7 +175,9 @@ def test_destination_already_critical_is_not_a_rejection_reason(client):
     assert item["eligible"] is True
 
 
-def test_multiple_transfers_are_evaluated_together(client):
+def test_multiple_transfers_are_evaluated_together():
+    # The subcentre's route is shortened inside the 6-hour cap so this test isolates the joint evaluation.
+    client, _ = mysql_client(FakeDatabase(routes=subcentre_route_within_limit()))
     single = ok(simulate(client, transfer("SC-SIM-001", "PHC-SIM-001", 100)))
     assert evaluation(single)["eligible"] is True
     together = ok(simulate(client, transfer("SC-SIM-001", "PHC-SIM-001", 100), transfer("SC-SIM-001", "PHC-SIM-001", 100)))
@@ -245,10 +257,12 @@ def test_unknown_facilities_are_rejected_with_a_useful_reason(client):
 
 def test_route_travel_time_sets_the_departure_day(client):
     too_soon = evaluation(ok(simulate(client, transfer("WH-SIM-001", "SC-SIM-001", 10))))
-    assert too_soon["rejectionCodes"] == ["TRAVEL_TIME_EXCEEDS_ARRIVAL_DAY"]
-    later = ok(simulate(client, transfer("WH-SIM-001", "SC-SIM-001", 10, arrival_day=3)))
-    assert (evaluation(later)["eligible"], evaluation(later)["departureDay"]) == (True, 2)
-    assert facility(later["intervention"], "WH-SIM-001")["projectedDailyStock"][1]["transferOut"] == 10.0
+    assert too_soon["rejectionCodes"] == ["TRAVEL_TIME_EXCEEDS_ARRIVAL_DAY", "TRAVEL_TIME_LIMIT_EXCEEDED"]
+    later = evaluation(ok(simulate(client, transfer("WH-SIM-001", "SC-SIM-001", 10, arrival_day=3))))
+    # The 30-hour route is over the 6-hour cap: it still departs on day 2 in the simulation but is never eligible.
+    assert (later["eligible"], later["applied"], later["departureDay"], later["rejectionCodes"]) == (False, True, 2, ["TRAVEL_TIME_LIMIT_EXCEEDED"])
+    body = ok(simulate(client, transfer("WH-SIM-001", "SC-SIM-001", 10, arrival_day=3)))
+    assert facility(body["intervention"], "WH-SIM-001")["projectedDailyStock"][1]["transferOut"] == 10.0
 
 
 def test_arrival_after_the_horizon_is_rejected(client):
@@ -259,14 +273,14 @@ def test_arrival_after_the_horizon_is_rejected(client):
 def test_batch_expiring_before_the_end_of_the_horizon_is_not_sent():
     short_dated = [row for row in INVENTORY_ROWS if not (row["facility_id"] == SUBCENTRE and row["medicine_id"] == 7)]
     short_dated.append(inventory_row(SUBCENTRE, 7, "SIM-007-B06", "400.00", expiry=date(2026, 9, 20)))
-    client, _ = mysql_client(FakeDatabase(inventory=short_dated))
+    client, _ = mysql_client(FakeDatabase(inventory=short_dated, routes=subcentre_route_within_limit()))
     item = evaluation(ok(simulate(client, transfer("SC-SIM-001", "PHC-SIM-001", 100))))
     assert (item["rejectionCodes"], item["applied"]) == (["BATCH_EXPIRES_BEFORE_USE"], False)
 
 
 def test_facility_without_usable_history_is_incomplete_data_and_excluded():
     rows = [row for row in CONSUMPTION_ROWS if not (row["facility_id"] == SUBCENTRE and row["medicine_id"] == 7)]
-    client, _ = mysql_client(FakeDatabase(consumption=rows))
+    client, _ = mysql_client(FakeDatabase(consumption=rows, routes=subcentre_route_within_limit()))
     body = ok(simulate(client, transfer("SC-SIM-001", "PHC-SIM-001", 10)))
     assert evaluation(body)["rejectionCodes"] == ["INCOMPLETE_DATA"]
     subcentre = facility(body["baseline"], "SC-SIM-001")

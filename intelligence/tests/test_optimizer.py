@@ -92,12 +92,12 @@ def test_critical_phc_receives_a_safe_warehouse_plan(client):
 
 def test_multi_source_plan_when_one_donor_is_not_enough():
     client, _ = optimizer_client(**multi_source_tables())
-    body = ok(optimize(client, "PHC-SIM-001", 900))
-    assert summary(body) == [("DH-SIM-001", 13, "SIM-007-B01", 270.0), ("WH-SIM-001", 14, "SIM-007-B02", 630.0)]
-    assert (candidate(body, "WH-SIM-001")["safeCapacity"], candidate(body, "DH-SIM-001")["safeCapacity"]) == (630.0, 365.5)
+    body = ok(optimize(client, "PHC-SIM-001", 800))
+    assert summary(body) == [("DH-SIM-001", 13, "SIM-007-B01", 170.0), ("WH-SIM-001", 14, "SIM-007-B02", 630.0)]
+    assert (candidate(body, "WH-SIM-001")["safeCapacity"], candidate(body, "DH-SIM-001")["safeCapacity"]) == (630.0, 188.5)
     # The warehouse keeps the least equity-weighted headroom cost, so it is used to its full safe capacity first.
-    assert (candidate(body, "WH-SIM-001")["allocatedQuantity"], candidate(body, "DH-SIM-001")["retainedFloor"]) == (630.0, 334.5)
-    assert total(body) == 900.0 and body["simulation"]["comparison"]["safeToRecommend"] is True
+    assert (candidate(body, "WH-SIM-001")["allocatedQuantity"], candidate(body, "DH-SIM-001")["retainedFloor"]) == (630.0, 111.5)
+    assert total(body) == 800.0 and body["simulation"]["comparison"]["safeToRecommend"] is True
     assert "from 2 donors" in body["rationale"]
 
 
@@ -107,7 +107,9 @@ def test_unsafe_hospital_donor_is_excluded_even_with_visible_surplus(client):
     assert (hospital["status"], hospital["rejectionCodes"], hospital["safeCapacity"]) == ("REJECTED", ["NO_SAFE_DONOR_CAPACITY"], 0.0)
     assert (hospital["effectiveStock"], hospital["protectedStock"], hospital["retainedFloor"]) == (1000.0, 700.0, 780.5)
     reason = hospital["rejectionReasons"][0]
-    assert "lowest projected stock from day 1 is 700 mL on day 6" in reason
+    # Its 700 mL delivery on day 7 is not counted, so its stock falls to 300 mL by day 14.
+    assert "lowest projected stock from day 1 is 300 mL on day 14" in reason
+    assert "700 mL scheduled for day 7" in reason and "not counted toward donor capacity" in reason
     assert "Effective stock minus protected stock (300 mL) is not a safe capacity" in reason
     # The simulator agrees that sending that visible surplus would breach protected stock.
     assert simulate(client, transfer("DH-SIM-001", "PHC-SIM-001", 300)).json()["transferEvaluations"][0]["rejectionCodes"] == ["BELOW_PROTECTED_STOCK"]
@@ -179,7 +181,8 @@ def test_expired_quarantined_and_reserved_stock_is_never_counted_or_sent(unusabl
     )
     client, _ = optimizer_client(inventory=rows)
     info = details(optimize(client, "PHC-SIM-001", 950))
-    assert info["safeCapacity"] == 901.63
+    # Only the warehouse counts: the subcentre's route is over the 6-hour limit.
+    assert info["safeCapacity"] == 900.0
     warehouse = next(item for item in info["eligibleCandidates"] if item["facilityId"] == "WH-SIM-001")
     assert (warehouse["effectiveStock"], warehouse["safeCapacity"]) == (1000.0, 900.0)
     body = ok(optimize(client, "PHC-SIM-001", 900))
@@ -198,20 +201,26 @@ def test_batches_expiring_before_the_horizon_end_are_not_sent():
     # FEFO picks the earliest expiry that stays in date until 2026-09-25, not the batch expiring on 2026-09-20.
     assert summary(body) == [("WH-SIM-001", 14, "SIM-007-B02", 600.0)]
     assert (candidate(body, "WH-SIM-001")["lastingBatchQuantity"], candidate(body, "WH-SIM-001")["safeCapacity"]) == (1000.0, 1000.0)
-    assert candidate(body, "SC-SIM-001")["rejectionCodes"][0] == "BATCH_EXPIRES_BEFORE_USE"
+    assert "BATCH_EXPIRES_BEFORE_USE" in candidate(body, "SC-SIM-001")["rejectionCodes"]
 
 
 def test_delivery_that_cannot_arrive_before_the_recipient_stockout_is_rejected():
     routes = routes_without(WAREHOUSE, PHC) + [route_row(WAREHOUSE, PHC, "1300.00", "30.00", True)]
-    client, _ = optimizer_client(routes=routes)
+    # A 48-hour limit keeps this 30-hour route inside the cap so the arrival-day rule is what rejects it.
+    client, _ = optimizer_client(config=OptimizerConfig(max_travel_hours=48), routes=routes)
     info = details(optimize(client, "PHC-SIM-001", 600))
     warehouse = next(item for item in info["rejectedCandidates"] if item["facilityId"] == "WH-SIM-001")
     assert warehouse["rejectionCodes"] == ["ARRIVES_AFTER_RECIPIENT_STOCKOUT"] and warehouse["earliestArrivalDay"] == 2
 
 
 def test_long_route_sets_departure_and_arrival_days(client):
-    body = ok(optimize(client, "SC-SIM-001", 10))
-    [item] = body["transfers"]
+    # The only route to SC-SIM-001 takes 30 hours, over the default 6-hour cap, so there is no plan.
+    info = details(optimize(client, "SC-SIM-001", 10))
+    warehouse = next(item for item in info["rejectedCandidates"] if item["facilityId"] == "WH-SIM-001")
+    assert warehouse["rejectionCodes"] == ["TRAVEL_TIME_LIMIT_EXCEEDED"]
+    # With a 48-hour limit the day arithmetic is unchanged: it leaves on day 1 and arrives on day 2.
+    longer, _ = optimizer_client(config=OptimizerConfig(max_travel_hours=48))
+    [item] = ok(optimize(longer, "SC-SIM-001", 10))["transfers"]
     assert (item["fromFacilityId"], item["departureDay"], item["arrivalDay"], item["arrivalDate"]) == ("WH-SIM-001", 1, 2, "2026-09-13")
 
 
@@ -318,7 +327,7 @@ def test_solver_uses_batches_first_expiry_first_in_whole_units_and_respects_forb
 
 def test_donors_gain_no_stockout_no_critical_label_and_regional_shortage_does_not_worsen():
     client, _ = optimizer_client(**multi_source_tables())
-    body = ok(optimize(client, "PHC-SIM-001", 900))
+    body = ok(optimize(client, "PHC-SIM-001", 800))
     simulation = body["simulation"]
     for donor in ("WH-SIM-001", "DH-SIM-001"):
         before, after = facility(simulation["baseline"], donor), facility(simulation["intervention"], donor)
@@ -333,13 +342,14 @@ def test_donors_gain_no_stockout_no_critical_label_and_regional_shortage_does_no
     checks = {check["name"]: check["passed"] for check in body["validation"]["checks"]}
     assert checks == dict.fromkeys(
         ["ALL_TRANSFERS_ELIGIBLE", "NO_NEW_REGIONAL_RISK", "NO_DONOR_CRITICAL", "NO_NEW_STOCKOUT", "REQUESTED_QUANTITY_SUPPLIED",
-         "REGIONAL_SHORTAGE_NOT_WORSE", "BATCH_ALLOCATION_MATCHES", "SAFE_TO_RECOMMEND"], True,
+         "REGIONAL_SHORTAGE_NOT_WORSE", "BATCH_ALLOCATION_MATCHES", "ROUTES_WITHIN_TRAVEL_LIMIT", "DONORS_SAFE_WITHOUT_FUTURE_SUPPLY",
+         "SAFE_TO_RECOMMEND"], True,
     )
 
 
 def test_final_plan_passes_the_ripple_simulator_when_resubmitted():
     client, _ = optimizer_client(**multi_source_tables())
-    body = ok(optimize(client, "PHC-SIM-001", 900))
+    body = ok(optimize(client, "PHC-SIM-001", 800))
     proposed = [transfer(item["fromFacilityId"], item["toFacilityId"], item["quantity"], medicine=item["medicineId"], arrival_day=item["arrivalDay"]) for item in body["transfers"]]
     resimulated = simulate(client, *proposed).json()
     assert all(item["eligible"] for item in resimulated["transferEvaluations"])
@@ -390,15 +400,16 @@ def test_plan_rejected_by_the_simulator_is_never_returned_and_the_next_plan_is_t
 
 def test_insufficient_regional_supply_returns_no_safe_plan_without_creating_stock(client):
     info = details(optimize(client, "PHC-SIM-001", 100000))
-    assert (info["requestedQuantity"], info["safeCapacity"], info["unmetQuantity"], info["unit"]) == (100000.0, 4501.63, 95498.37, "mL")
+    # Only the warehouse counts: the subcentre's 1.63 mL sits behind a route over the 6-hour limit.
+    assert (info["requestedQuantity"], info["safeCapacity"], info["unmetQuantity"], info["unit"]) == (100000.0, 4500.0, 95500.0, "mL")
     assert round(sum(item["safeCapacity"] for item in info["eligibleCandidates"]), 2) == info["safeCapacity"]
     assert info["candidatesConsidered"] == 4 and all(item["rejectionReasons"] for item in info["rejectedCandidates"])
-    assert any("up to 4501.63 mL" in item for item in info["recommendedEscalation"])
+    assert any("up to 4500 mL" in item for item in info["recommendedEscalation"])
     assert any("expedite the delayed replenishment of 600 mL" in item for item in info["recommendedEscalation"])
     # Exactly the reported safe capacity can be planned, and nothing more.
-    body = ok(optimize(client, "PHC-SIM-001", 4501.63))
-    assert sorted(summary(body)) == [("SC-SIM-001", 14, "SIM-007-B02", 1.63), ("WH-SIM-001", 14, "SIM-007-B02", 4500.0)]
-    details(optimize(client, "PHC-SIM-001", 4501.64))
+    body = ok(optimize(client, "PHC-SIM-001", 4500))
+    assert summary(body) == [("WH-SIM-001", 14, "SIM-007-B02", 4500.0)]
+    details(optimize(client, "PHC-SIM-001", 4500.01))
 
 
 # ---- Offline fixture ----

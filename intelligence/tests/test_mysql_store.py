@@ -297,7 +297,9 @@ def test_mysql_forecast_reports_units_decimals_replenishment_and_context():
         "units", "asOfDate", "medicineCriticality", "facilityRemoteness", "protectedStock", "effectiveStock", "replenishments", "regionalPeers",
     }
     assert mappings["units"]["status"] == "DATABASE_POLICY"
-    assert all(mapping["status"] == "PROVISIONAL" for name, mapping in mappings.items() if name != "units")
+    # Dhiren approved the effective-stock rule for the hackathon prototype; the other interpretations stay provisional.
+    assert mappings["effectiveStock"]["status"] == "APPROVED_FOR_HACKATHON_PROTOTYPE"
+    assert all(mapping["status"] == "PROVISIONAL" for name, mapping in mappings.items() if name not in ("units", "effectiveStock"))
     assert any(note.startswith("2 open replenishment order(s)") for note in context["notes"])
     assert "facilityRemoteness: Risk signal = remoteness_score / 10 (provisional; review: Aaryan)." in body["assumptions"]
 
