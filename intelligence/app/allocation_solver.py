@@ -9,7 +9,7 @@ Decision variables, per donor d:
 - batch_units[d][b]   how much batch b sends (one transfer instruction per batch used)
 - arrives[d][o]       whether donor d delivers on arrival option o (at most one option per donor)
 - sent[d][o]          the quantity arriving through option o
-- headroom[d][o]      per mille of option o's safe capacity that is sent
+- headroom[d][o]      parts per million of option o's safe capacity that is sent
 The recipient's day-by-day stock, unmet demand and shortage days follow app/stock_projection.py exactly: deliveries
 and replenishments arrive at the start of the day and stock is floored at zero.
 
@@ -22,7 +22,7 @@ Hard constraints:
 The objective is optimised in lexicographic stages. Each stage's optimum is fixed as a constraint before the next
 stage, so shortage always outranks donor protection, which always outranks logistics:
 1. RECIPIENT_SHORTAGE = 31 x unmet demand (hundredths) + 1 x shortage days
-2. DONOR_PROTECTION   = sum over donors of headroom used (per mille) x (100 + equity index)
+2. DONOR_PROTECTION   = sum over donors of headroom used (parts per million) x (100 + equity index)
 3. LOGISTICS          = 10^10 x arrival days + 1000 x distance (tenths of a km) + 1 x (donors + transfer instructions)
 
 The search is deterministic: one worker, a fixed seed and a deterministic (not wall-clock) time limit.
@@ -34,14 +34,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 QUANTITY_SCALE = 100
-PER_MILLE = 1000
+# Headroom is measured in parts per million of a donor's safe capacity (rounded up). A coarser unit lets rounding tie
+# a clean split with one that takes slightly more from the donor with less headroom.
+HEADROOM_SCALE = 1_000_000
 MAX_HORIZON_DAYS = 30
 RANDOM_SEED = 0
 
 # One hundredth of unmet demand outweighs every shortage day of the longest horizon.
 UNMET_DEMAND_WEIGHT = MAX_HORIZON_DAYS + 1
 SHORTAGE_DAY_WEIGHT = 1
-# Headroom used costs 100 per mille; a donor's equity index (0 for a central warehouse) is added to that weight.
+# Headroom used costs 100 per part per million; a donor's equity index (0 for a central warehouse) is added to that weight.
 HEADROOM_WEIGHT = 100
 EQUITY_WEIGHT = 1
 ARRIVAL_DAY_WEIGHT = 10**10
@@ -81,11 +83,11 @@ OBJECTIVE_STAGES = (
     ObjectiveStage(2, "DONOR_PROTECTION", (
         ObjectiveTerm(
             "donorHeadroomUsed", HEADROOM_WEIGHT,
-            "Per mille of each donor's safe capacity that is sent, summed over donors: donors that keep more headroom are preferred.",
+            "Parts per million of each donor's safe capacity that is sent, summed over donors: donors that keep more headroom are preferred.",
         ),
         ObjectiveTerm(
             "remoteDonorEquityImpact", EQUITY_WEIGHT,
-            "The same per mille multiplied by the donor's equity index (100 x equity uplift): rural and remote donors cost more.",
+            "The same parts per million multiplied by the donor's equity index (100 x equity uplift): rural and remote donors cost more.",
         ),
     )),
     ObjectiveStage(3, "LOGISTICS", (
@@ -233,10 +235,10 @@ def solve_allocation(
         for option in donor.options:
             arrives = model.new_bool_var(f"arrives_{index}_day_{option.arrival_day}")
             quantity = model.new_int_var(0, option.capacity, f"sent_{index}_day_{option.arrival_day}")
-            headroom = model.new_int_var(0, PER_MILLE, f"headroom_{index}_day_{option.arrival_day}")
+            headroom = model.new_int_var(0, HEADROOM_SCALE, f"headroom_{index}_day_{option.arrival_day}")
             model.add(quantity <= option.capacity * arrives)
             model.add(quantity >= step).only_enforce_if(arrives)
-            model.add(PER_MILLE * quantity <= option.capacity * headroom)
+            model.add(HEADROOM_SCALE * quantity <= option.capacity * headroom)
             variables.extend((arrives, quantity, headroom))
             flags.append(arrives)
             quantities.append(quantity)

@@ -76,6 +76,11 @@ class Batch:
     # batches.batch_id when the data source records one; None for the fixture, which only has batch numbers.
     batch_id: int | None = None
 
+    @property
+    def fefo_key(self) -> tuple:
+        """First expiry first, then the database batch_id; the batch number orders batches only when no ID exists (fixture)."""
+        return (self.expiry_date, self.batch_id is None, self.batch_id if self.batch_id is not None else 0, self.batch_no)
+
     def is_usable_on(self, day: date) -> bool:
         return self.status == "USABLE" and self.expiry_date >= day
 

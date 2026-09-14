@@ -166,7 +166,8 @@ class FacilityOutcome:
 def load_facility_state(store: SimulatedDataStore, facility: Facility, medicine: Medicine, inventory: InventorySnapshot) -> FacilityState:
     """Forecast demand and protected stock exactly as POST /forecast does."""
     effective_stock = inventory.effective_stock(store.as_of)
-    usable = tuple(sorted((batch for batch in inventory.batches if batch.is_usable_on(store.as_of)), key=lambda batch: (batch.expiry_date, batch.batch_no)))
+    # FEFO: earliest expiry first, then the database batch_id (the batch number only when the fixture has no IDs).
+    usable = tuple(sorted((batch for batch in inventory.batches if batch.is_usable_on(store.as_of)), key=lambda batch: batch.fefo_key))
     history_start, history_end = store.history_window
     demand, basis, reason = None, UNAVAILABLE, None
     if not store.has_consumption_records(facility.id, medicine.id):

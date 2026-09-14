@@ -829,8 +829,8 @@ OPTIMIZER_ASSUMPTIONS = (
     "The objective is optimised in lexicographic stages: recipient shortage (unmet demand, then shortage days), then donor "
     "protection and equity, then logistics (arrival day, distance, number of transfers). Donor safety and the exact quantity "
     "are hard constraints.",
-    "Batches are allocated earliest expiry first (then batch number); each batch is a separate transfer instruction because a "
-    "database transfer names one batch.",
+    "Batches are allocated earliest expiry first, then by database batch ID (by batch number only in the fixture, which has no "
+    "batch IDs); each batch is a separate transfer instruction because a database transfer names one batch.",
     "A plan is returned only after the Ripple Simulator evaluates the complete plan and marks it safe to recommend; the "
     "optimizer never declares its own result safe.",
     "The plan ID is a SHA-256 digest of the request, the transfers and the data context, so an identical request on unchanged "
@@ -894,11 +894,13 @@ def optimizer_mappings(scenario: Scenario) -> list[DataMapping]:
             name="batchIdentity",
             source="inventory.batch_id, batches.batch_number, batches.expiry_date" if database else "fixture batch numbers and expiry dates",
             rule=(
-                "Each transfer instruction names one batch, allocated earliest expiry first; batchId is batches.batch_id."
-                if database else "Each transfer instruction names one batch, allocated earliest expiry first; batchId is the batch number, "
-                "as in backend/src/fixture-store.js."
+                "Each transfer instruction names one batch, allocated earliest expiry first and then by batches.batch_id; batchId is "
+                "batches.batch_id. Persisting it in transfers is Sahil's pending Node work."
+                if database else "Each transfer instruction names one batch, allocated earliest expiry first and then by batch number "
+                "(the fixture has no batch IDs); batchId is the batch number, as in backend/src/fixture-store.js."
             ),
-            review_owner="Dhiren and Sahil",
+            review_owner="Dhiren",
+            status=APPROVED_FOR_HACKATHON_PROTOTYPE,
         ),
         DataMapping(
             name="quantityScale",
