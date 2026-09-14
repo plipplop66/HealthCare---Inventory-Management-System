@@ -96,6 +96,10 @@ BELOW_PROTECTED_STOCK = "BELOW_PROTECTED_STOCK"
 DONOR_BECOMES_CRITICAL = "DONOR_BECOMES_CRITICAL"
 CREATES_REGIONAL_SHORTAGE = "CREATES_REGIONAL_SHORTAGE"
 ARRIVES_AFTER_RECIPIENT_STOCKOUT = "ARRIVES_AFTER_RECIPIENT_STOCKOUT"
+TRAVEL_TIME_LIMIT_EXCEEDED = "TRAVEL_TIME_LIMIT_EXCEEDED"
+# The approved prototype limit on a donor-to-destination route. OptimizerConfig.max_travel_hours defaults to it, and
+# POST /scenarios/simulate and POST /plans/optimize both apply that one configured value.
+DEFAULT_MAX_TRAVEL_HOURS = 6.0
 
 
 class SimulationError(Exception):
@@ -324,6 +328,39 @@ def transfer_arrivals(schedule: Mapping[int, float]) -> list[Replenishment]:
     return [Replenishment(quantity=quantity, arrival_day=day, status=TRANSFER_STATUS) for day, quantity in sorted(schedule.items())]
 
 
+def check_max_travel_hours(value: object) -> float:
+    """The configured route cap must be a finite number of hours greater than zero."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError("max_travel_hours must be a finite number of hours greater than zero.")
+    return float(value)
+
+
+def exceeds_travel_limit(route: Route | None, max_travel_hours: float) -> bool:
+    """Whether a route is longer than the cap; a route of exactly the cap is allowed."""
+    return route is not None and route.travel_hours > max_travel_hours
+
+
+def travel_limit_reason(source: Facility, destination: Facility, route: Route, max_travel_hours: float) -> str:
+    return (
+        f"{source.name} ({source.id}) to {destination.name} ({destination.id}): the route takes {_number(route.travel_hours)} "
+        f"hours, exceeding the configured {_number(max_travel_hours)}-hour maximum donor travel time, so it is outside the "
+        "prototype transfer limit."
+    )
+
+
+def check_travel_limit(evaluations: Sequence[TransferEvaluation], max_travel_hours: float) -> None:
+    """Reject every transfer on a route over the cap.
+
+    When nothing else blocks it the transfer is still simulated, so its effect on stock stays visible, but it is never
+    eligible, so the scenario is never safe to recommend.
+    """
+    for evaluation in evaluations:
+        if exceeds_travel_limit(evaluation.route, max_travel_hours):
+            evaluation.reject(
+                TRAVEL_TIME_LIMIT_EXCEEDED, travel_limit_reason(evaluation.source, evaluation.destination, evaluation.route, max_travel_hours)
+            )
+
+
 def check_transfer(store: SimulatedDataStore, states: Mapping[str, FacilityState], medicine: Medicine, horizon_days: int, evaluation: TransferEvaluation) -> None:
     """Identity, data, route, cold-chain and timing checks that decide whether a transfer can be simulated."""
     transfer = evaluation.transfer
@@ -349,7 +386,9 @@ def check_transfer(store: SimulatedDataStore, states: Mapping[str, FacilityState
         evaluation.reject(
             MEDICINE_IDENTITY_MISMATCH,
             f"Medicine '{transfer.medicine_id}' ({describe_medicine(requested)}) is not the scenario medicine {medicine.id} "
-            f"({describe_medicine(medicine)}). A scenario moves one exact medicine identity and no substitution is made.",
+            f"({describe_medicine(medicine)}). A scenario moves one exact medicine identity and no substitution is made. "
+            "Manual pharmacist or qualified clinical review is required before any other medicine is considered; this transfer "
+            "remains rejected.",
         )
 
     same_facility = source is not None and destination is not None and source.id == destination.id
@@ -578,6 +617,7 @@ class SimulationResult:
     baseline: Mapping[str, FacilityOutcome]
     intervention: Mapping[str, FacilityOutcome]
     evaluations: tuple[TransferEvaluation, ...]
+    max_travel_hours: float
 
 
 def simulate(
@@ -585,10 +625,12 @@ def simulate(
     transfers: Sequence[ProposedTransfer],
     horizon_days: int,
     config: RiskConfig = DEFAULT_RISK_CONFIG,
+    max_travel_hours: float = DEFAULT_MAX_TRAVEL_HOURS,
 ) -> SimulationResult:
     """Evaluate every proposed transfer together against one isolated regional snapshot."""
     if horizon_days not in ALLOWED_HORIZON_DAYS:
         raise ValueError("horizon_days must be one of 7, 14 or 30.")
+    max_travel_hours = check_max_travel_hours(max_travel_hours)
     if not transfers:
         raise ValueError("At least one transfer is required.")
     medicine = scenario_medicine(store, transfers)
@@ -611,10 +653,12 @@ def simulate(
     applied = [evaluation for evaluation in evaluations if evaluation.eligible]
     for evaluation in applied:
         evaluation.applied = True
+    # After the applied set is fixed: a route over the cap is still simulated but is never eligible.
+    check_travel_limit(evaluations, max_travel_hours)
 
     intervention = project_intervention(store, states, medicine, horizon_days, config, applied)
     check_impact(store, states, medicine, horizon_days, baseline, intervention, applied)
-    return SimulationResult(store, medicine, horizon_days, states, baseline, intervention, evaluations)
+    return SimulationResult(store, medicine, horizon_days, states, baseline, intervention, evaluations, max_travel_hours)
 
 
 SIMULATION_ASSUMPTIONS = (
@@ -634,6 +678,24 @@ SIMULATION_ASSUMPTIONS = (
 DECISION_SUPPORT_ASSUMPTION = (
     "Decision support only: a qualified person must review and approve every operational transfer before any stock moves."
 )
+
+
+def travel_limit_assumption(max_travel_hours: float) -> str:
+    return (
+        f"A transfer route may take at most {_number(max_travel_hours)} hours, the same configured limit POST /plans/optimize "
+        "applies (approved for the hackathon prototype). A longer route is still simulated so its effect on stock is visible, but "
+        "the transfer is ineligible (TRAVEL_TIME_LIMIT_EXCEEDED) and the scenario is not safe to recommend."
+    )
+
+
+# Shared with the optimizer: the reviewed transfer rules hold only for this prototype, and no patient-impact metric exists.
+PROTOTYPE_VALIDATION_LIMITATION = (
+    "The transfer rules are approved only for the MEDRIPPLE hackathon prototype; real deployment requires clinical, "
+    "regulatory and operational validation."
+)
+PATIENT_IMPACT_LIMITATION = (
+    "Patient impact is not calculated by this prototype; only a qualified clinical or public-health assessment could estimate this."
+)
 SIMULATION_LIMITATIONS = (
     "Risk weights and thresholds are prototype assumptions and are not clinically validated.",
     "Batch expiry within the horizon, transport losses, vehicle and storage capacity, and cost are not modelled.",
@@ -641,6 +703,8 @@ SIMULATION_LIMITATIONS = (
     "Supplier reliability is not used: delayed orders are assumed to arrive on their current expected date.",
     "One medicine is simulated per scenario, and patients are not redistributed between facilities.",
     "Nothing is written to the data source: no transfer is created and no inventory is changed.",
+    PROTOTYPE_VALIDATION_LIMITATION,
+    PATIENT_IMPACT_LIMITATION,
 )
 
 
@@ -1021,7 +1085,10 @@ def build_simulation_response(result: SimulationResult) -> SimulationResponse:
         intervention=intervention,
         transfer_evaluations=evaluations,
         comparison=comparison,
-        assumptions=[*SIMULATION_ASSUMPTIONS, context.protected_stock_assumption, DECISION_SUPPORT_ASSUMPTION, *mapping_assumptions],
+        assumptions=[
+            *SIMULATION_ASSUMPTIONS, travel_limit_assumption(result.max_travel_hours), context.protected_stock_assumption,
+            DECISION_SUPPORT_ASSUMPTION, *mapping_assumptions,
+        ],
         limitations=list(SIMULATION_LIMITATIONS),
         decision_support_only=True,
         data_context=SimulationDataContextBlock(
@@ -1043,10 +1110,15 @@ def build_simulation_response(result: SimulationResult) -> SimulationResponse:
     )
 
 
-def run_simulation(store: SimulatedDataStore, request: SimulationRequest, config: RiskConfig = DEFAULT_RISK_CONFIG) -> SimulationResponse:
+def run_simulation(
+    store: SimulatedDataStore,
+    request: SimulationRequest,
+    config: RiskConfig = DEFAULT_RISK_CONFIG,
+    max_travel_hours: float = DEFAULT_MAX_TRAVEL_HOURS,
+) -> SimulationResponse:
     """POST /scenarios/simulate: evaluate a validated request against one data-store snapshot."""
     transfers = [
         ProposedTransfer(item.from_facility_id, item.to_facility_id, item.medicine_id, item.quantity, item.arrival_day)
         for item in request.transfers
     ]
-    return build_simulation_response(simulate(store, transfers, request.horizon_days, config))
+    return build_simulation_response(simulate(store, transfers, request.horizon_days, config, max_travel_hours))

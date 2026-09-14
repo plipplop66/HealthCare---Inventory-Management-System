@@ -129,6 +129,10 @@ class ConsumptionRecord:
     issue: str | None = None
 
 
+# Review status of a rule accepted for this hackathon prototype only; it is never a clinical validation.
+APPROVED_FOR_HACKATHON_PROTOTYPE = "APPROVED_FOR_HACKATHON_PROTOTYPE"
+
+
 @dataclass(frozen=True)
 class DataMapping:
     """How one data-source field is interpreted for the engine."""
