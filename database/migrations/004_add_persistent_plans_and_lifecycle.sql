@@ -76,6 +76,58 @@ PREPARE add_dispatch_columns_statement FROM @add_dispatch_columns;
 EXECUTE add_dispatch_columns_statement;
 DEALLOCATE PREPARE add_dispatch_columns_statement;
 
+-- Legacy transfers were created before optimiser plans were persisted. Give
+-- each one a deterministic, explicitly simulated historical plan. This only
+-- links existing history: it does not reserve inventory or create approvals.
+INSERT INTO plans (
+  plan_id, destination_facility_id, medicine_id, requested_quantity,
+  horizon_days, status, rationale, plan_json, created_at, decided_at, decided_by
+)
+SELECT
+  CONCAT('simulated-history-transfer-', LPAD(t.transfer_id, 10, '0')),
+  t.destination_facility_id,
+  t.medicine_id,
+  t.quantity,
+  14,
+  CASE
+    WHEN t.status IN ('REJECTED_UNSAFE', 'REJECTED') THEN 'REJECTED'
+    ELSE t.status
+  END,
+  CONCAT(
+    'Simulated historical record backfilled from legacy transfer ',
+    t.transfer_id,
+    ': ',
+    COALESCE(t.note, 'No legacy note recorded.')
+  ),
+  JSON_OBJECT(
+    'id', CONCAT('simulated-history-transfer-', LPAD(t.transfer_id, 10, '0')),
+    'simulatedHistoricalRecord', TRUE,
+    'source', 'MYSQL_LIFECYCLE_MIGRATION',
+    'sourceTransferId', t.transfer_id,
+    'destinationFacilityId', t.destination_facility_id,
+    'medicineId', t.medicine_id,
+    'requestedQuantity', t.quantity,
+    'horizonDays', 14,
+    'status', CASE WHEN t.status IN ('REJECTED_UNSAFE', 'REJECTED') THEN 'REJECTED' ELSE t.status END,
+    'note', t.note
+  ),
+  t.requested_at,
+  CASE WHEN t.status = 'PROPOSED' THEN NULL ELSE COALESCE(t.approved_at, t.requested_at) END,
+  CASE
+    WHEN t.status = 'PROPOSED' THEN NULL
+    ELSE COALESCE(t.approved_by, 'MEDRIPPLE Feasibility Engine')
+  END
+FROM transfers t
+WHERE t.plan_id IS NULL
+ON DUPLICATE KEY UPDATE plan_id = VALUES(plan_id);
+
+UPDATE transfers
+SET plan_id = CONCAT('simulated-history-transfer-', LPAD(transfer_id, 10, '0'))
+WHERE plan_id IS NULL;
+
+ALTER TABLE transfers
+  MODIFY plan_id VARCHAR(64) NOT NULL;
+
 SELECT COUNT(*) INTO @has_plan_fk
 FROM information_schema.table_constraints
 WHERE table_schema = DATABASE() AND table_name = 'transfers'
