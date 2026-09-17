@@ -635,7 +635,7 @@ Where each item Samson's UI needs already appears (no duplicate fields were adde
 | Safe to recommend | - | `comparison.safeToRecommend` | `simulation.comparison.safeToRecommend`, `validation.passed` |
 | Human approval required | `decisionSupportOnly` | `decisionSupportOnly` | `requiresHumanApproval`, `decisionSupportOnly` |
 
-**No patient-days-at-risk.** No response from this service calculates or exposes patient-days at risk or any other patient-impact metric; Aaryan rejected it as not clinically validated. The simulator and optimizer state this in `limitations`. The Node backend's own `patientDaysAtRisk` is outside this service.
+**No patient-days-at-risk.** No response from this service calculates or exposes patient-days at risk or any other patient-impact metric; Aaryan rejected it as not clinically validated. The simulator and optimizer state this in `limitations`, and the Node backend does not report one either.
 
 ### Deferred decisions
 

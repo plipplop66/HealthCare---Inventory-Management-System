@@ -63,7 +63,7 @@ Persistent accounts require `DATA_SOURCE=mysql` and the `app_users` table.
 | `POST` | `/api/auth/login` | Start a signed session |
 | `GET` | `/api/auth/me` | Read the current signed-in account |
 | `POST` | `/api/auth/logout` | End the client-side stateless session |
-| `GET` | `/api/region/summary` | Resilience score, alerts, earliest stockout, and patient-days at risk |
+| `GET` | `/api/region/summary` | Resilience score, alerts, earliest stockout and critical-facility count for the default medicine (insulin) |
 | `GET` | `/api/facilities` | Facility coordinates, simulated risk, supply coverage, and safe surplus |
 | `GET` | `/api/facilities/:facilityId/inventory?medicineId=:medicineId` | Medicine identity, batches, effective/recorded stock, consumption, and incoming supply |
 | `GET` | `/api/medicines` | Fixture medicine catalogue |

@@ -15,7 +15,6 @@ export const summary = {
     resilienceScore: 67,
     earliestStockout: { facilityId: 'PHC-VLR-001', facilityName: 'Vellore Primary Health Centre', daysRemaining: 0.9 },
     criticalFacilityCount: 1,
-    patientDaysAtRisk: 505,
     alerts: [{ facilityId: 'PHC-VLR-001', riskLabel: 'CRITICAL', cause: 'LOW_SIMULATED_COVERAGE', daysRemaining: 0.9 }],
     dataFreshness: 'SIMULATED DATABASE',
   },

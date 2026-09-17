@@ -44,7 +44,6 @@ function simulateCoverage(profile, horizonDays, transferArrivals = []) {
   let stock = Number(profile.effectiveStock);
   let stockoutDay = null;
   let shortageDays = 0;
-  let patientDaysAtRisk = 0;
   const dailyDemand = Number(profile.dailyDemand);
   const arrivals = new Map();
   for (const arrival of transferArrivals) {
@@ -60,7 +59,6 @@ function simulateCoverage(profile, horizonDays, transferArrivals = []) {
     if (stock < 0) {
       if (stockoutDay === null) stockoutDay = day;
       shortageDays += 1;
-      patientDaysAtRisk += Math.ceil(Math.abs(stock) / Math.max(dailyDemand, 1));
       stock = 0;
     }
   }
@@ -70,7 +68,6 @@ function simulateCoverage(profile, horizonDays, transferArrivals = []) {
     endingStock: Number(stock.toFixed(2)),
     stockoutDay,
     shortageDays,
-    patientDaysAtRisk,
     plannedArrivals: [...arrivals.entries()]
       .map(([day, quantity]) => ({ day, quantity }))
       .sort((left, right) => left.day - right.day)
@@ -145,8 +142,6 @@ async function simulateScenario({ transfers, horizonDays }, inventoryStore) {
       criticalFacilityDelta: afterCritical - beforeCritical,
       shortageDayDelta: after.reduce((total, facility) => total + facility.shortageDays, 0)
         - before.reduce((total, facility) => total + facility.shortageDays, 0),
-      patientDaysAtRiskDelta: after.reduce((total, facility) => total + facility.patientDaysAtRisk, 0)
-        - before.reduce((total, facility) => total + facility.patientDaysAtRisk, 0),
       newRisks,
       safeToRecommend: evaluations.every((item) => item.eligible) && newRisks.length === 0
     },

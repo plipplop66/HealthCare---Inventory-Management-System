@@ -96,17 +96,12 @@ function createApiRouter({ authService, intelligenceAdapter, inventoryStore }) {
     const averageRisk = facilities.length
       ? facilities.reduce((total, facility) => total + facility.riskScore, 0) / facilities.length
       : 0;
-    const patientDaysAtRisk = facilities.reduce((total, facility) => {
-      const shortageBeforeWeekEnd = Math.max(0, 7 - (facility.daysRemaining || 0));
-      return total + Math.ceil(shortageBeforeWeekEnd * facility.dailyDemand);
-    }, 0);
     success(response, {
       resilienceScore: Math.max(0, Math.round(100 - averageRisk)),
       earliestStockout: sortedByCoverage[0]
         ? { facilityId: sortedByCoverage[0].facilityId, facilityName: sortedByCoverage[0].name || sortedByCoverage[0].facilityName, daysRemaining: sortedByCoverage[0].daysRemaining }
         : null,
       criticalFacilityCount: criticalFacilities.length,
-      patientDaysAtRisk,
       alerts: criticalFacilities.map((facility) => ({
         facilityId: facility.facilityId, riskLabel: facility.riskLabel, cause: 'LOW_SIMULATED_COVERAGE', daysRemaining: facility.daysRemaining
       })),

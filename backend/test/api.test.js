@@ -40,6 +40,13 @@ test('health endpoint identifies the running backend', async () => {
   assert.equal(body.data.dataSource, 'FIXTURE_STORE');
 });
 
+test('the region summary reports simulated coverage risk without a patient-impact metric', async () => {
+  const { response, body } = await request('/api/region/summary', { headers: approverHeaders });
+  assert.equal(response.status, 200);
+  assert.deepEqual(Object.keys(body.data).sort(), ['alerts', 'criticalFacilityCount', 'dataFreshness', 'earliestStockout', 'resilienceScore']);
+  assert.doesNotMatch(JSON.stringify(body), /patient/i);
+});
+
 test('inventory excludes expired stock from effective stock', async () => {
   const { response, body } = await request('/api/facilities/facility-navjeevan-phc/inventory', { headers: approverHeaders });
   assert.equal(response.status, 200);
@@ -72,6 +79,7 @@ test('simulator rejects a transfer that drains a donor below protected safety st
   // The local rules are a labelled development fallback, not the intelligence service.
   assert.deepEqual([body.data.source, body.data.isFallback, body.data.fallbackReason], ['FIXTURE_FALLBACK', true, 'INTELLIGENCE_UNAVAILABLE']);
   assert.deepEqual([body.meta.source, body.meta.fallback], ['FIXTURE_FALLBACK', true]);
+  assert.doesNotMatch(JSON.stringify(body.data), /patient/i);
 });
 
 test('safe plan can be approved and creates an audit record', async () => {
