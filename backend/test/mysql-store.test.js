@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { createMysqlStore, project } = require('../src/mysql-store');
+const { createMysqlStore, isMysqlContentionError, orderTransfersForReservation, project } = require('../src/mysql-store');
 
 const config = {
   databaseUrl: '', databaseHost: '127.0.0.1', databasePort: 3306, databaseName: 'medripple',
@@ -92,13 +92,13 @@ function decisionPlan(transfers = [[14, 'TN-007-B01-26', 40]], fromFacilityId = 
 
 // WH-001 holds one 5000 mL batch. DH-MDU-001 holds two batches (600 + 900 mL usable) and keeps 1000 mL of safety stock.
 const DONOR_ROWS = [
-  { inventoryId: 11, facilityCode: 'WH-001', batchId: 14, batchNo: 'TN-007-B01-26', status: 'AVAILABLE', quarantined: 0, expiryDate: '2028-02-29', quantity: 5000 },
-  { inventoryId: 31, facilityCode: 'DH-MDU-001', batchId: 21, batchNo: 'LOT-A', status: 'AVAILABLE', quarantined: 0, expiryDate: '2028-02-29', quantity: 600 },
-  { inventoryId: 32, facilityCode: 'DH-MDU-001', batchId: 22, batchNo: 'LOT-B', status: 'AVAILABLE', quarantined: 0, expiryDate: '2028-04-24', quantity: 900 },
-  { inventoryId: 33, facilityCode: 'DH-MDU-001', batchId: 22, batchNo: 'LOT-B', status: 'QUARANTINED', quarantined: 0, expiryDate: '2028-04-24', quantity: 300 }
+  { inventoryId: 11, facilityId: 1, medicineId: 7, facilityCode: 'WH-001', batchId: 14, batchNo: 'TN-007-B01-26', status: 'AVAILABLE', quarantined: 0, expiryDate: '2028-02-29', quantity: 5000 },
+  { inventoryId: 31, facilityId: 3, medicineId: 7, facilityCode: 'DH-MDU-001', batchId: 21, batchNo: 'LOT-A', status: 'AVAILABLE', quarantined: 0, expiryDate: '2028-02-29', quantity: 600 },
+  { inventoryId: 32, facilityId: 3, medicineId: 7, facilityCode: 'DH-MDU-001', batchId: 22, batchNo: 'LOT-B', status: 'AVAILABLE', quarantined: 0, expiryDate: '2028-04-24', quantity: 900 },
+  { inventoryId: 33, facilityId: 3, medicineId: 7, facilityCode: 'DH-MDU-001', batchId: 22, batchNo: 'LOT-B', status: 'QUARANTINED', quarantined: 0, expiryDate: '2028-04-24', quantity: 300 }
 ];
 
-function transactionStore({ updateRows = 1, rows = DONOR_ROWS } = {}) {
+function transactionStore({ updateRows = 1, rows = DONOR_ROWS, contentionError = null } = {}) {
   const calls = [];
   const connection = {
     async beginTransaction() { calls.push('BEGIN'); },
@@ -107,8 +107,13 @@ function transactionStore({ updateRows = 1, rows = DONOR_ROWS } = {}) {
     release() { calls.push('RELEASE'); },
     async query(sql, values) {
       calls.push({ sql, values });
+      if (sql.includes('SELECT status FROM plans')) return [[{ status: 'PROPOSED' }]];
       if (sql.includes('UPDATE plans')) return [{ affectedRows: 1 }];
-      if (sql.includes('FOR UPDATE OF i')) return [rows.filter((row) => values[0].includes(row.facilityCode))];
+      if (sql.includes('ORDER BY i.facility_id')) return [rows.filter((row) => values[0].includes(row.facilityCode))];
+      if (sql.includes('WHERE i.inventory_id = ?')) {
+        if (contentionError) throw contentionError;
+        return [[rows.find((row) => row.inventoryId === values[0])].filter(Boolean)];
+      }
       if (sql.includes('FROM facility_safety_stock')) return [[{ facilityCode: 'DH-MDU-001', safetyStock: 1000 }].filter((row) => values[0].includes(row.facilityCode))];
       if (sql.includes('UPDATE inventory i')) return [{ affectedRows: updateRows }];
       if (sql.includes('INSERT INTO transfers')) return [{ affectedRows: 1, insertId: 91 }];
@@ -139,8 +144,9 @@ test('MySQL approval reserves donor stock, transfer item, and audit in one trans
   const result = await approve(store, plan, { expectedDonorStock: await store.readDonorStock(plan) });
   assert.equal(result.planStatus, 'RESERVED');
   assert.deepEqual(calls.filter((item) => typeof item === 'string'), ['BEGIN', 'COMMIT', 'RELEASE']);
-  const [lock] = sqlCalls(calls, 'FOR UPDATE OF i');
-  assert.deepEqual(lock.values, [['WH-001'], '7']);
+  assert.match(calls.find((item) => item.sql)?.sql, /SELECT status FROM plans.*FOR UPDATE/);
+  assert.deepEqual(sqlCalls(calls, 'WHERE i.inventory_id = ?').map((item) => item.values[0]), [11]);
+  assert.match(sqlCalls(calls, 'ORDER BY i.facility_id')[0].sql, /ORDER BY i\.facility_id, b\.medicine_id, i\.batch_id/);
   assert.match(sqlCalls(calls, 'FROM facility_safety_stock')[0].sql, /FOR SHARE OF safety/);
   const [stockUpdate] = sqlCalls(calls, 'UPDATE inventory i');
   assert.doesNotMatch(stockUpdate.sql, /safety_stock_qty/);
@@ -189,6 +195,48 @@ test('MySQL stale stock rolls back without persisting a transfer or audit event'
   assert.ok(!calls.includes('COMMIT'));
   assert.deepEqual(sqlCalls(calls, 'INSERT INTO transfers'), []);
   assert.deepEqual(sqlCalls(calls, 'INSERT INTO audit_events'), []);
+});
+
+test('MySQL approval locks and updates opposite-input donors in canonical numeric key order', async () => {
+  const rows = [DONOR_ROWS[2], DONOR_ROWS[1], DONOR_ROWS[0]];
+  const { calls, store } = transactionStore({ rows });
+  const plan = decisionPlan();
+  plan.transfers = [
+    { fromFacilityId: 'DH-MDU-001', toFacilityId: 'PHC-001', medicineId: '7', batchId: 21, batchNo: 'LOT-A', quantity: 100 },
+    { fromFacilityId: 'WH-001', toFacilityId: 'PHC-001', medicineId: '7', batchId: 14, batchNo: 'TN-007-B01-26', quantity: 40 }
+  ];
+
+  assert.deepEqual(orderTransfersForReservation(plan.transfers, rows).map((item) => item.fromFacilityId), ['WH-001', 'DH-MDU-001']);
+  await approve(store, plan);
+  assert.deepEqual(sqlCalls(calls, 'WHERE i.inventory_id = ?').map((item) => item.values[0]), [11, 31, 32]);
+  assert.deepEqual(sqlCalls(calls, 'UPDATE inventory i').map((item) => item.values.slice(0, 4)), [
+    [40, 'WH-001', 14, 'TN-007-B01-26'],
+    [100, 'DH-MDU-001', 21, 'LOT-A']
+  ]);
+});
+
+test('MySQL deadlocks and serialization conflicts roll back as retryable stock conflicts', async () => {
+  for (const databaseError of [
+    Object.assign(new Error('deadlock'), { code: 'ER_LOCK_DEADLOCK', errno: 1213 }),
+    Object.assign(new Error('serialization'), { sqlState: '40001' })
+  ]) {
+    assert.equal(isMysqlContentionError(databaseError), true);
+    const { calls, store } = transactionStore({ contentionError: databaseError });
+    await assert.rejects(approve(store, decisionPlan()), (error) => {
+      assert.equal(error.status, 409);
+      assert.equal(error.code, 'PLAN_STOCK_CHANGED');
+      assert.deepEqual(error.details, {
+        planId: 'plan-atomic-001',
+        reason: 'CONCURRENT_RESERVATION',
+        instruction: 'Refresh the plan and re-run the optimizer before approving again.'
+      });
+      return true;
+    });
+    assert.deepEqual(calls.filter((item) => typeof item === 'string'), ['BEGIN', 'ROLLBACK', 'RELEASE']);
+    assert.deepEqual(sqlCalls(calls, 'UPDATE inventory'), []);
+    assert.deepEqual(sqlCalls(calls, 'INSERT INTO transfers'), []);
+    assert.deepEqual(sqlCalls(calls, 'INSERT INTO audit_events'), []);
+  }
 });
 
 test('MySQL delivery adds the reserved batch to recipient inventory and audits it', async () => {
