@@ -7,6 +7,7 @@ const {
 const { isServiceFailure } = require('./intelligence-adapter');
 const { simulateScenario, optimisePlan, isFixtureSource } = require('./scenario-service');
 const { createPlanStore } = require('./plan-store');
+const { FIXTURE_REVALIDATION, buildRevalidationRequest, revalidatePlan } = require('./plan-revalidation');
 
 function success(response, data, meta = {}) {
   response.json({ data, meta: { ...meta, requestId: response.locals.requestId } });
@@ -161,13 +162,29 @@ function createApiRouter({ authService, intelligenceAdapter, inventoryStore }) {
     success(response, plan, { source: inventoryStore.source });
   }));
 
+  // Approval order: authenticated approver, exact stored plan, PROPOSED, then (for APPROVE) the plan's exact transfers
+  // are revalidated by the intelligence service, and only then does the database transaction reserve stock.
   router.post('/plans/:planId/approve', requireRole('APPROVER', 'ADMIN'), asyncHandler(async (request, response) => {
     const decision = validateDecision(request.body);
     const plan = await loadPlan(request.params.planId);
     if (!plan) throw new AppError(404, 'PLAN_NOT_FOUND', 'The requested plan was not found.');
+    if (plan.status !== 'PROPOSED') {
+      throw new AppError(409, 'PLAN_ALREADY_DECIDED', 'Only a proposed plan can be approved or rejected.', { planId: plan.id, status: plan.status });
+    }
     const actor = `${request.user.name} <${request.user.email}>`;
-    const result = await planStore.decide(request.params.planId, { ...decision, actor }, inventoryStore);
-    success(response, result, { source: inventoryStore.source, decisionSupportOnly: true });
+    let revalidation;
+    let expectedDonorStock;
+    if (decision.decision === 'APPROVE') {
+      if (isPersistentStore) {
+        const revalidationRequest = buildRevalidationRequest(plan);
+        expectedDonorStock = await inventoryStore.readDonorStock(plan);
+        revalidation = await revalidatePlan(plan, revalidationRequest, intelligenceAdapter, inventoryStore.source);
+      } else {
+        revalidation = FIXTURE_REVALIDATION;
+      }
+    }
+    const result = await planStore.decide(plan.id, { ...decision, actor, revalidation, expectedDonorStock }, inventoryStore);
+    success(response, { ...result, ...(revalidation ? { revalidation } : {}) }, { source: inventoryStore.source, decisionSupportOnly: true });
   }));
 
   for (const [path, action] of [['dispatch', 'DISPATCH'], ['deliver', 'DELIVER'], ['cancel', 'CANCEL']]) {
