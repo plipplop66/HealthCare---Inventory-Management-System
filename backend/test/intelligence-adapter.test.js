@@ -59,6 +59,63 @@ test('uses the intelligence service for a compatible ripple simulation', async (
   assert.deepEqual(service.requests, [{ url: '/scenarios/simulate', body: input }]);
 });
 
+test('service failures map to timeout, unavailable and invalid-response errors; decisions pass through', async (t) => {
+  const request = { horizonDays: 14, transfers: [{ fromFacilityId: 'WH-TN-001', toFacilityId: 'PHC-VLR-001', medicineId: '7', quantity: 300, arrivalDay: 1 }] };
+  const stopped = http.createServer();
+  await new Promise((resolve) => stopped.listen(0, '127.0.0.1', resolve));
+  const stoppedUrl = `http://127.0.0.1:${stopped.address().port}`;
+  await new Promise((resolve) => stopped.close(resolve));
+  const cases = [
+    [() => 'HANG', { status: 503, code: 'INTELLIGENCE_TIMEOUT' }],
+    [null, { status: 503, code: 'INTELLIGENCE_UNAVAILABLE' }],
+    [() => ({ status: 503, body: { error: { code: 'DATABASE_UNAVAILABLE', message: 'db down' } } }), { status: 503, code: 'INTELLIGENCE_UNAVAILABLE' }],
+    [() => ({ body: '<html>' }), { status: 503, code: 'INVALID_INTELLIGENCE_RESPONSE' }],
+    [() => ({ status: 405, body: '' }), { status: 503, code: 'INVALID_INTELLIGENCE_RESPONSE' }],
+    [() => ({ status: 422, body: { error: { code: 'INVALID_REQUEST', message: 'Bad transfer.', details: { index: 0 } } } }), { status: 422, code: 'INVALID_REQUEST' }]
+  ];
+  for (const [handler, expected] of cases) {
+    const url = handler ? (await startFakeIntelligence(t, handler)).url : stoppedUrl;
+    const adapter = createIntelligenceAdapter({ intelligenceServiceUrl: url, intelligenceTimeoutMs: 200 }, {});
+    for (const run of [() => adapter.simulate(request), () => adapter.revalidatePlan(request), () => adapter.optimize({ destinationFacilityId: 'PHC-VLR-001', medicineId: '7', quantity: 300, horizonDays: 14 })]) {
+      await assert.rejects(run(), (error) => {
+        assert.deepEqual({ status: error.status, code: error.code }, expected);
+        if (expected.code === 'INVALID_REQUEST') assert.deepEqual(error.details, { index: 0 });
+        assert.doesNotMatch(error.message, /db down|<html>/);
+        return true;
+      });
+    }
+  }
+});
+
+test('plan revalidation requires route, batch and received-stock evidence', async (t) => {
+  const request = {
+    horizonDays: 14,
+    transfers: [{ fromFacilityId: 'WH-TN-001', toFacilityId: 'PHC-VLR-001', medicineId: '7', quantity: 300, batchId: 14, batchNo: 'TN-007-B01-26', departureDay: 1, arrivalDay: 1 }]
+  };
+  const removals = [
+    (response) => { delete response.receivedStockCheck; },
+    (response) => { response.receivedStockCheck.donors[0].passed = 'true'; },
+    (response) => { delete response.maxTravelHours; },
+    (response) => { delete response.modelVersion; },
+    (response) => { delete response.dataContext; },
+    (response) => { delete response.medicine.requiresColdChain; },
+    (response) => { delete response.transferEvaluations[0].route; },
+    (response) => { response.transferEvaluations[0].route = { distanceKm: 1 }; },
+    (response) => { delete response.transferEvaluations[0].batches[0].batchId; },
+    (response) => { response.transferEvaluations[0].index = 1; }
+  ];
+  for (const remove of removals) {
+    const service = await startFakeIntelligence(t, ({ body }) => { const response = simulationResponse(body); remove(response); return { body: response }; });
+    const adapter = createIntelligenceAdapter({ intelligenceServiceUrl: service.url, intelligenceTimeoutMs: 1000 }, {});
+    await assert.rejects(adapter.revalidatePlan(request), { status: 503, code: 'INVALID_INTELLIGENCE_RESPONSE' });
+  }
+  const service = await startFakeIntelligence(t, ({ body }) => ({ body: simulationResponse(body) }));
+  const adapter = createIntelligenceAdapter({ intelligenceServiceUrl: service.url, intelligenceTimeoutMs: 1000 }, {});
+  const accepted = await adapter.revalidatePlan(request);
+  assert.equal(accepted.source, 'INTELLIGENCE_SERVICE');
+  assert.deepEqual(service.requests[0].body, request);
+});
+
 test('uses the intelligence optimizer plan without discarding batch persistence data', async (t) => {
   const service = await startFakeIntelligence(t, () => ({ body: planResponse() }));
   const adapter = createIntelligenceAdapter({ intelligenceServiceUrl: service.url, intelligenceTimeoutMs: 1000 }, {});
