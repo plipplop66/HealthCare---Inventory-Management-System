@@ -1,8 +1,16 @@
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
 const { AppError } = require('./errors');
 const { postgresTls } = require('./postgres-tls');
 
 const DEFAULT_FIXTURE_MEDICINE_ID = 'med-insulin-100iu-vial';
+const DATE_OID = 1082;
+// DATE columns stay as their stored YYYY-MM-DD text, as mysql2's dateStrings: ['DATE'] does for the MySQL
+// store. pg would otherwise build a local-midnight Date, which serialises as the previous day east of UTC.
+const postgresTypes = {
+  getTypeParser(oid, format) {
+    return oid === DATE_OID && format !== 'binary' ? (value) => value : types.getTypeParser(oid, format);
+  }
+};
 let sharedPool = null;
 
 function asNumber(value) { return Number(value || 0); }
@@ -58,6 +66,7 @@ function createPool(config) {
   sharedPool = new Pool({
     connectionString: config.databaseUrl,
     ssl: postgresTls(config),
+    types: postgresTypes,
     // Vercel functions are short lived; a small pool prevents exhausting the
     // Supabase connection allowance when multiple functions warm concurrently.
     max: 3,
@@ -454,4 +463,4 @@ class PostgresInventoryStore {
   }
 }
 
-module.exports = { PostgresInventoryStore, project, riskForDays };
+module.exports = { PostgresInventoryStore, project, riskForDays, postgresTypes };
