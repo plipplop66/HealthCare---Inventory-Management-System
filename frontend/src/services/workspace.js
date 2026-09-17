@@ -12,9 +12,38 @@ export function createWorkspace({ api, storage }) {
   let catalog = null;
   let facilityRows = [];
 
+  const recordAction = async (planId, note, send, confirmed) => {
+    if (!String(note || '').trim()) {
+      return { ok: false, error: new ApiError('Enter a note before recording this decision.', { code: 'NOTE_REQUIRED' }), plan: null };
+    }
+    let response;
+    try {
+      response = await send();
+    } catch (error) {
+      if (error.status === 401) throw error;
+      let plan = null;
+      try { plan = await api.plan(planId); } catch { /* Keep the original error visible. */ }
+      return { ok: false, error, plan };
+    }
+    const plan = await api.plan(planId).catch(() => null);
+    if (!confirmed(response.data)) {
+      return { ok: false, error: new ApiError(`The API answered, but the plan is ${response.data?.plan?.status || 'in an unknown state'}.`, { code: 'UNEXPECTED_DECISION_RESULT', requestId: response.meta.requestId }), plan };
+    }
+    return { ok: true, response, plan };
+  };
+
   const toAssessment = (stored, plan) => (stored.noSafePlan
     ? { kind: 'NO_SAFE_PLAN', request: stored.request, message: stored.message, details: stored.details || {}, requestId: stored.requestId || '' }
     : { kind: 'PLAN', request: stored.request, plan });
+
+  // The latest assessment after navigation or refresh: a stored plan is re-read by ID, never re-optimized.
+  const loadAssessment = async () => {
+    const stored = assessment.get();
+    const result = await loadSelectedPlan(assessment, (id) => api.plan(id));
+    if (result.noSelectedPlan) return result.missingPlan ? { kind: 'MISSING' } : null;
+    if (result.noSafePlan) return toAssessment(result);
+    return toAssessment(stored, result);
+  };
 
   return {
     selection,
@@ -65,13 +94,32 @@ export function createWorkspace({ api, storage }) {
 
     clearAssessment() { assessment.set(null); },
 
-    // The latest assessment after navigation or refresh: a stored plan is re-read by ID, never re-optimized.
-    async loadAssessment() {
-      const stored = assessment.get();
-      const result = await loadSelectedPlan(assessment, (id) => api.plan(id));
-      if (result.noSelectedPlan) return result.missingPlan ? { kind: 'MISSING' } : null;
-      if (result.noSafePlan) return toAssessment(result);
-      return toAssessment(stored, result);
+    loadAssessment,
+
+    // Plan review: the selected plan re-read by ID, plus the recorded decision evidence for a decided plan.
+    async loadPlanReview() {
+      const selected = await loadAssessment();
+      if (selected?.kind !== 'PLAN' || selected.plan.data.status === 'PROPOSED') return { assessment: selected, decisionEvent: null };
+      const envelope = await api.audit();
+      const raw = (envelope.data || []).find((item) => String(item.entityId ?? item.planId) === selected.plan.data.id && ['RESERVE', 'REJECT'].includes(item.action));
+      const event = raw ? mapAudit({ ...envelope, data: [raw] }).rows[0] : null;
+      return { assessment: selected, decisionEvent: event ? { ...event, revalidation: raw.afterState?.revalidation || null } : null };
+    },
+
+    // Records a human decision. Success is reported only when the API confirms the expected status:
+    // RESERVED after a revalidated database approval, APPROVED for a fixture approval, REJECTED for a rejection.
+    // Any failure re-reads the plan so the screen shows its real, unchanged status.
+    async decide(planId, decision, note) {
+      return recordAction(planId, note, () => api.decide(planId, decision, note.trim()), (data) => {
+        if (decision === 'REJECT') return data.plan?.status === 'REJECTED';
+        if (data.plan?.status === 'RESERVED') return data.revalidation?.performed === true && data.revalidation?.passed === true;
+        return data.plan?.status === 'APPROVED' && data.revalidation?.performed === false;
+      });
+    },
+
+    async transition(planId, action, note) {
+      const expected = { DISPATCH: 'IN_TRANSIT', DELIVER: 'DELIVERED', CANCEL: 'CANCELLED' }[action];
+      return recordAction(planId, note, () => api.transition(planId, action, note.trim()), (data) => data.plan?.status === expected);
     },
 
     async loadAudit() {

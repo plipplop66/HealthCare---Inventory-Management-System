@@ -1,3 +1,4 @@
+import { ErrorPanel } from '../components/ErrorPanel';
 import { CandidateTable, PlanEvidence } from '../components/Evidence';
 import { SelectionBar } from '../components/SelectionBar';
 import { Button, Card, PageHead, SourceBadge, Stat, StatusPill } from '../components/ui';
@@ -50,7 +51,8 @@ export function RippleSimulator({ catalog, selection, onSelection, onRun, busy, 
   return <>
     <PageHead eyebrow="ripple simulation" title="Assess a transfer before action" copy="Submits the selection to the optimizer through the MEDRIPPLE API. Nothing is reserved until an approver approves the plan." />
     <SelectionBar catalog={catalog} selection={selection} onChange={onSelection} onSubmit={onRun} submitLabel="run safety assessment" busy={busy} />
-    {error && <section className="info-banner warning" role="alert"><div>!</div><p><strong>Assessment failed</strong>{error.message}</p></section>}
+    {error && <ErrorPanel error={error} />}
+    {error && !assessment && <p className="muted" role="status">No plan is selected: a failed assessment never leaves an earlier plan open for approval.</p>}
     {assessment?.kind === 'MISSING' && <section className="info-banner warning" role="status"><div>!</div><p><strong>The previous plan is no longer available</strong>Run a new assessment.</p></section>}
     {assessment?.kind === 'NO_SAFE_PLAN' && <NoSafePlanResult assessment={assessment} catalog={catalog} />}
     {assessment?.kind === 'PLAN' && <SafePlanResult assessment={assessment} catalog={catalog} onReview={onReview} />}

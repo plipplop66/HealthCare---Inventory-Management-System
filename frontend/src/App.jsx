@@ -3,6 +3,7 @@ import './auth.css';
 import { Icon } from './components/Icon';
 import { AuthScreen } from './components/AuthScreen';
 import { SelectionBar } from './components/SelectionBar';
+import { ErrorPanel } from './components/ErrorPanel';
 import { Button, EmptyOrError } from './components/ui';
 import { medrippleApi, usingMockData } from './services/medrippleApi';
 import { completeSelection } from './services/selection';
@@ -63,10 +64,15 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [page, setPage] = useState({ key: '', data: null, error: null });
   const [version, setVersion] = useState(0);
-  const [message, setMessage] = useState('');
+  const [outcome, setOutcome] = useState(null);
+  const [sessionNotice, setSessionNotice] = useState('');
   const refreshing = useRef(false);
 
   const updateSelection = (patch) => setSelectionState(workspace.selection.set(patch));
+  const sessionEnded = () => {
+    setSessionNotice('Your session has ended. Sign in again to continue.');
+    setUser(null);
+  };
 
   const loadDashboard = async () => {
     if (refreshing.current) return;
@@ -78,7 +84,7 @@ function App() {
       setSelectionState(workspace.selection.set(completeSelection(workspace.selection.get(), loaded.catalog, loaded.dashboard)));
       setDashboardError(null);
     } catch (error) {
-      if (error.status === 401) setUser(null);
+      if (error.status === 401) sessionEnded();
       else setDashboardError(error);
     } finally { refreshing.current = false; }
   };
@@ -102,7 +108,7 @@ function App() {
   // The latest assessment is restored by plan ID after a refresh; opening a page never re-optimizes.
   useEffect(() => {
     if (!user || assessment || !workspace.hasAssessment()) return;
-    workspace.loadAssessment().then(setAssessment).catch((error) => { if (error.status === 401) setUser(null); else setAssessError(error); });
+    workspace.loadAssessment().then(setAssessment).catch((error) => { if (error.status === 401) sessionEnded(); else setAssessError(error); });
   }, [user]);
 
   const pageKey = view === 'facility' && selection.facilityId && selection.medicineId ? `facility:${selection.facilityId}:${selection.medicineId}:${selection.horizonDays}:${version}`
@@ -112,11 +118,11 @@ function App() {
     let active = true;
     setPage({ key: pageKey, data: null, error: null });
     const load = view === 'facility' ? () => workspace.loadFacility(selection)
-      : view === 'plan' ? () => workspace.loadAssessment().then((result) => ({ assessment: result }))
+      : view === 'plan' ? () => workspace.loadPlanReview()
         : view === 'candidates' ? () => workspace.loadAssessment().then((result) => ({ candidates: mapCandidates(result) }))
         : () => workspace.loadAudit();
     load().then((data) => { if (active) setPage({ key: pageKey, data, error: null }); })
-      .catch((error) => { if (!active) return; if (error.status === 401) setUser(null); else setPage({ key: pageKey, data: null, error }); });
+      .catch((error) => { if (!active) return; if (error.status === 401) sessionEnded(); else setPage({ key: pageKey, data: null, error }); });
     return () => { active = false; };
   }, [user, pageKey]);
 
@@ -125,35 +131,34 @@ function App() {
     setBusy(true);
     setAssessError(null);
     setAssessment(null);
+    setOutcome(null);
     try {
       setAssessment(await workspace.runAssessment(selection, unit));
     } catch (error) {
-      if (error.status === 401) setUser(null);
+      if (error.status === 401) sessionEnded();
       else setAssessError(error);
     } finally { setBusy(false); }
   };
 
-  const decide = async (decision, note) => {
+  // Approval, rejection and lifecycle actions. The outcome is kept per plan; success is shown only when the API
+  // confirmed the expected status, and the plan is re-read either way.
+  const act = async (action, run) => {
+    const planId = page.data.assessment.plan.data.id;
     setBusy(true);
-    setMessage('');
+    setOutcome(null);
     try {
-      const { data } = await medrippleApi.decide(page.data.assessment.plan.data.id, decision, note);
-      setMessage(`Plan is now ${data.plan.status}.`);
+      const result = await run(planId);
+      setOutcome({ planId, action, ...result });
       setVersion((current) => current + 1);
-    } catch (error) { setMessage(error.message); } finally { setBusy(false); }
+    } catch (error) {
+      if (error.status === 401) sessionEnded();
+      else setOutcome({ planId, action, ok: false, error });
+    } finally { setBusy(false); }
   };
+  const decide = (decision, note) => act(decision, (planId) => workspace.decide(planId, decision, note));
+  const transition = (lifecycleAction, note) => act(lifecycleAction, (planId) => workspace.transition(planId, lifecycleAction, note));
 
-  const transition = async (action, note) => {
-    setBusy(true);
-    setMessage('');
-    try {
-      const { data } = await medrippleApi.transition(page.data.assessment.plan.data.id, action, note);
-      setMessage(`Plan is now ${data.plan.status}.`);
-      setVersion((current) => current + 1);
-    } catch (error) { setMessage(error.message); } finally { setBusy(false); }
-  };
-
-  const onAuthenticated = (sessionUser) => { setView('dashboard'); setDashboard(null); setUser(sessionUser); };
+  const onAuthenticated = (sessionUser) => { setSessionNotice(''); setView('dashboard'); setDashboard(null); setUser(sessionUser); };
   const onSignOut = async () => {
     await medrippleApi.logout();
     workspace.reset();
@@ -161,6 +166,7 @@ function App() {
     setUser(null);
     setDashboard(null);
     setAssessment(null);
+    setOutcome(null);
   };
   const openFacility = (facilityId, medicineId) => {
     updateSelection(medicineId ? { facilityId, medicineId } : { facilityId });
@@ -172,7 +178,7 @@ function App() {
     if (view === 'simulator') return <RippleSimulator catalog={catalog} selection={selection} onSelection={updateSelection} onRun={runAssessment} busy={busy} assessment={assessment} error={assessError} onReview={() => setView('plan')} />;
     const selectionBar = view === 'facility' && <SelectionBar catalog={catalog} selection={selection} onChange={updateSelection} showQuantity={false} />;
     if (page.key !== pageKey || (!page.data && !page.error)) return <>{selectionBar}<p role="status">Loading {view} from the API…</p></>;
-    if (page.error) return <>{selectionBar}<EmptyOrError title="This section is unavailable" copy={page.error.message} retry={() => setVersion((current) => current + 1)} /></>;
+    if (page.error) return <>{selectionBar}<ErrorPanel error={page.error} onRetry={() => setVersion((current) => current + 1)} /></>;
     if (view === 'facility') return <>{selectionBar}<FacilityDetail data={page.data} onAssess={() => setView('simulator')} /></>;
     if (view === 'candidates') return <Candidates data={page.data.candidates} onOpenSimulator={() => setView('simulator')} />;
     if (view === 'plan') {
@@ -180,14 +186,14 @@ function App() {
       if (!selected) return <EmptyOrError title="Select a plan to review" copy="Run a safety assessment in the ripple simulator first. Opening this page never creates a plan." actionLabel="open ripple simulator" retry={() => setView('simulator')} />;
       if (selected.kind === 'MISSING') return <EmptyOrError title="The selected plan is no longer available" copy="Run a new assessment in the ripple simulator." actionLabel="open ripple simulator" retry={() => setView('simulator')} />;
       if (selected.kind === 'NO_SAFE_PLAN') return <EmptyOrError title="Your latest assessment found no safe plan" copy="No transfer can be approved. Open the simulator for capacity and reasons." actionLabel="open ripple simulator" retry={() => setView('simulator')} />;
-      return <PlanReview key={selected.plan.data.id} plan={selected.plan} canDecide={['APPROVER', 'ADMIN'].includes(user?.role)} busy={busy} onDecision={decide} onLifecycle={transition} message={message} />;
+      return <PlanReview key={selected.plan.data.id} plan={selected.plan} role={user?.role} busy={busy} outcome={outcome?.planId === selected.plan.data.id ? outcome : null} decisionEvent={page.data.decisionEvent} onDecision={decide} onLifecycle={transition} onOpenSimulator={() => setView('simulator')} />;
     }
     return <AuditTrail data={page.data} />;
   })();
 
   if (!authReady) return <div className="app-state"><Icon name="ripple" size={28} /><strong>loading medripple</strong><span>checking your session…</span></div>;
-  if (!user) return <AuthScreen api={medrippleApi} onAuthenticate={onAuthenticated} />;
-  if (dashboardError && !dashboard) return <div className="app-state"><EmptyOrError title="regional workspace unavailable" copy={dashboardError.message} retry={loadDashboard} /><Button onClick={onSignOut}>sign out</Button></div>;
+  if (!user) return <AuthScreen api={medrippleApi} onAuthenticate={onAuthenticated} notice={sessionNotice} />;
+  if (dashboardError && !dashboard) return <div className="app-state"><ErrorPanel error={dashboardError} onRetry={loadDashboard} /><Button onClick={onSignOut}>sign out</Button></div>;
   if (!dashboard || !catalog) return <div className="app-state"><Icon name="ripple" size={28} /><strong>loading medripple</strong><span>reading the regional snapshot from the API…</span></div>;
   return <Shell active={view} onNavigate={setView} menuOpen={menuOpen} setMenuOpen={setMenuOpen} dataLabel={dashboard.dataFreshness} facilityCount={dashboard.facilitiesMonitored} user={user} onSignOut={onSignOut}>
     {content}
