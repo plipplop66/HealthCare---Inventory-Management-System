@@ -1,7 +1,17 @@
 const mysql = require('mysql2/promise');
 const { AppError } = require('./errors');
+const { assertReservable, donorCodes, normaliseDonorRows, planMedicineId } = require('./reservation-guard');
 
 const DEFAULT_FIXTURE_MEDICINE_ID = 'med-insulin-100iu-vial';
+// Every inventory row of the plan's donors for its medicine; FOR UPDATE OF i locks only inventory rows.
+const DONOR_STOCK_SQL = `
+  SELECT i.inventory_id AS inventoryId, source.facility_code AS facilityCode, i.batch_id AS batchId,
+         b.batch_number AS batchNo, i.status, b.quarantined, b.expiry_date AS expiryDate, i.quantity_on_hand AS quantity
+  FROM inventory i
+  JOIN facilities source ON source.facility_id = i.facility_id
+  JOIN batches b ON b.batch_id = i.batch_id
+  WHERE source.facility_code IN (?) AND CAST(b.medicine_id AS CHAR) = ?
+  ORDER BY i.inventory_id`;
 
 function asNumber(value) {
   return Number(value || 0);
@@ -322,7 +332,11 @@ function createMysqlStore(config, dependencies = {}) {
     async assertQuantityPrecision(medicineId, quantity) {
       await assertQuantityPrecision(medicineId, quantity);
     },
-    async recordPlanDecision({ plan, decision, actor, note, beforeState, afterState }) {
+    // The donor rows read before the intelligence service revalidates a plan; approval requires them unchanged.
+    async readDonorStock(plan) {
+      return normaliseDonorRows(await query(DONOR_STOCK_SQL, [donorCodes(plan), planMedicineId(plan)]));
+    },
+    async recordPlanDecision({ plan, decision, actor, note, beforeState, afterState, expectedDonorStock }) {
       let connection;
       try {
         connection = await pool.getConnection();
@@ -338,34 +352,54 @@ function createMysqlStore(config, dependencies = {}) {
           throw new AppError(409, 'PLAN_ALREADY_DECIDED', 'Only a proposed plan can be approved or rejected.');
         }
 
-        const transferIds = [];
-        for (const transfer of plan.transfers) {
-          if (decision === 'APPROVE') {
+        if (decision === 'APPROVE') {
+          const donors = donorCodes(plan);
+          const medicineId = planMedicineId(plan);
+          const [lockedRows] = await connection.query(`${DONOR_STOCK_SQL} FOR UPDATE OF i`, [donors, medicineId]);
+          const [safetyRows] = await connection.query(
+            `SELECT source.facility_code AS facilityCode, safety.safety_stock_qty AS safetyStock
+             FROM facility_safety_stock safety JOIN facilities source ON source.facility_id = safety.facility_id
+             WHERE source.facility_code IN (?) AND CAST(safety.medicine_id AS CHAR) = ?
+             FOR SHARE OF safety`,
+            [donors, medicineId]
+          );
+          assertReservable({
+            plan,
+            rows: lockedRows,
+            safetyStock: new Map(safetyRows.map((row) => [row.facilityCode, row.safetyStock])),
+            simulationDate: config.simulationDate,
+            expectedRows: expectedDonorStock
+          });
+          for (const transfer of plan.transfers) {
+            // The same row conditions again, so a reservation can never succeed on a row the checks did not see.
             const [stockResult] = await connection.query(
               `UPDATE inventory i
                JOIN facilities source ON source.facility_id = i.facility_id
                JOIN batches b ON b.batch_id = i.batch_id
-               LEFT JOIN facility_safety_stock safety
-                 ON safety.facility_id = i.facility_id AND safety.medicine_id = b.medicine_id
                SET i.quantity_on_hand = i.quantity_on_hand - ?
                WHERE source.facility_code = ?
                  AND i.batch_id = ?
-                 AND b.medicine_id = ?
+                 AND b.batch_number = ?
+                 AND CAST(b.medicine_id AS CHAR) = ?
                  AND i.status = 'AVAILABLE'
                  AND b.quarantined = FALSE
                  AND b.expiry_date >= DATE_ADD(?, INTERVAL ? DAY)
-                 AND i.quantity_on_hand >= ?
-                 AND i.quantity_on_hand - ? >= COALESCE(safety.safety_stock_qty, 0)`,
+                 AND i.quantity_on_hand >= ?`,
               [
-                transfer.quantity, transfer.fromFacilityId, transfer.batchId, transfer.medicineId,
-                config.simulationDate, plan.horizonDays - 1, transfer.quantity, transfer.quantity
+                transfer.quantity, transfer.fromFacilityId, transfer.batchId, transfer.batchNo, medicineId,
+                config.simulationDate, plan.horizonDays, transfer.quantity
               ]
             );
             if (stockResult.affectedRows !== 1) {
-              throw new AppError(409, 'PLAN_STOCK_CHANGED', 'The donor stock changed after this plan was generated. Re-run the optimizer and review the new conditions.');
+              throw new AppError(409, 'PLAN_STOCK_CHANGED', 'The donor stock changed after this plan was generated. Nothing was reserved; re-run the optimizer and review the new conditions.', {
+                planId: plan.id, failures: [{ fromFacilityId: transfer.fromFacilityId, batchId: transfer.batchId, reason: 'RESERVATION_ROW_CHANGED' }]
+              });
             }
           }
+        }
 
+        const transferIds = [];
+        for (const transfer of plan.transfers) {
           const [transferResult] = await connection.query(
             `INSERT INTO transfers (
               plan_id, origin_facility_id, destination_facility_id, medicine_id, batch_id, quantity,

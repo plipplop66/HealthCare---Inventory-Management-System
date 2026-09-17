@@ -1,9 +1,19 @@
 const { Pool, types } = require('pg');
 const { AppError } = require('./errors');
 const { postgresTls } = require('./postgres-tls');
+const { assertReservable, donorCodes, normaliseDonorRows, planMedicineId } = require('./reservation-guard');
 
 const DEFAULT_FIXTURE_MEDICINE_ID = 'med-insulin-100iu-vial';
 const DATE_OID = 1082;
+// Every inventory row of the plan's donors for its medicine; FOR UPDATE takes the row locks in inventory_id order.
+const DONOR_STOCK_SQL = `
+  SELECT i.inventory_id AS "inventoryId", source.facility_code AS "facilityCode", i.batch_id AS "batchId",
+         b.batch_number AS "batchNo", i.status, b.quarantined, b.expiry_date AS "expiryDate", i.quantity_on_hand AS quantity
+  FROM inventory i
+  JOIN facilities source ON source.facility_id = i.facility_id
+  JOIN batches b ON b.batch_id = i.batch_id
+  WHERE source.facility_code = ANY($1::TEXT[]) AND b.medicine_id::TEXT = $2
+  ORDER BY i.inventory_id`;
 // DATE columns stay as their stored YYYY-MM-DD text, as mysql2's dateStrings: ['DATE'] does for the MySQL
 // store. pg would otherwise build a local-midnight Date, which serialises as the previous day east of UTC.
 const postgresTypes = {
@@ -268,7 +278,48 @@ class PostgresInventoryStore {
     }
   }
 
-  async recordPlanDecision({ plan, decision, actor, note, beforeState, afterState }) {
+  // The donor rows read before the intelligence service revalidates a plan; approval requires them unchanged.
+  async readDonorStock(plan) {
+    return normaliseDonorRows(await this.query(DONOR_STOCK_SQL, [donorCodes(plan), planMedicineId(plan)]));
+  }
+
+  async reserveStock(client, plan, expectedDonorStock) {
+    const donors = donorCodes(plan);
+    const medicineId = planMedicineId(plan);
+    const locked = await client.query(`${DONOR_STOCK_SQL} FOR UPDATE OF i`, [donors, medicineId]);
+    const safety = await client.query(
+      `SELECT source.facility_code AS "facilityCode", safety.safety_stock_qty AS "safetyStock"
+       FROM facility_safety_stock safety JOIN facilities source ON source.facility_id = safety.facility_id
+       WHERE source.facility_code = ANY($1::TEXT[]) AND safety.medicine_id::TEXT = $2
+       FOR SHARE OF safety`, [donors, medicineId]
+    );
+    assertReservable({
+      plan,
+      rows: locked.rows,
+      safetyStock: new Map(safety.rows.map((row) => [row.facilityCode, row.safetyStock])),
+      simulationDate: this.config.simulationDate,
+      expectedRows: expectedDonorStock
+    });
+    for (const transfer of plan.transfers) {
+      // The same row conditions again, so a reservation can never succeed on a row the checks did not see.
+      const stockResult = await client.query(
+        `UPDATE inventory i SET quantity_on_hand = i.quantity_on_hand - $1, last_updated = CURRENT_TIMESTAMP
+         FROM facilities source, batches b
+         WHERE source.facility_id = i.facility_id AND source.facility_code = $2 AND i.batch_id = $3 AND b.batch_id = i.batch_id
+           AND b.batch_number = $4 AND b.medicine_id::TEXT = $5 AND i.status = 'AVAILABLE' AND b.quarantined = FALSE
+           AND b.expiry_date >= ($6::DATE + $7::INTEGER) AND i.quantity_on_hand >= $1
+         RETURNING i.inventory_id`,
+        [transfer.quantity, transfer.fromFacilityId, transfer.batchId, transfer.batchNo, medicineId, this.config.simulationDate, plan.horizonDays]
+      );
+      if (stockResult.rowCount !== 1) {
+        throw new AppError(409, 'PLAN_STOCK_CHANGED', 'The donor stock changed after this plan was generated. Nothing was reserved; re-run the optimizer and review the new conditions.', {
+          planId: plan.id, failures: [{ fromFacilityId: transfer.fromFacilityId, batchId: transfer.batchId, reason: 'RESERVATION_ROW_CHANGED' }]
+        });
+      }
+    }
+  }
+
+  async recordPlanDecision({ plan, decision, actor, note, beforeState, afterState, expectedDonorStock }) {
     let client;
     try {
       client = await this.pool.connect();
@@ -279,24 +330,9 @@ class PostgresInventoryStore {
          WHERE plan_id = $3 AND status = 'PROPOSED' RETURNING plan_id`, [planStatus, actor, plan.id]
       );
       if (planResult.rowCount !== 1) throw new AppError(409, 'PLAN_ALREADY_DECIDED', 'Only a proposed plan can be approved or rejected.');
+      if (decision === 'APPROVE') await this.reserveStock(client, plan, expectedDonorStock);
       const transferIds = [];
       for (const transfer of plan.transfers) {
-        if (decision === 'APPROVE') {
-          const stockResult = await client.query(
-            `UPDATE inventory i SET quantity_on_hand = i.quantity_on_hand - $1, last_updated = CURRENT_TIMESTAMP
-             FROM facilities source, batches b
-             WHERE source.facility_id = i.facility_id AND source.facility_code = $2 AND i.batch_id = $3 AND b.batch_id = i.batch_id
-               AND b.medicine_id = $4 AND i.status = 'AVAILABLE' AND b.quarantined = FALSE
-               AND b.expiry_date >= ($5::DATE + ($6::INTEGER - 1)) AND i.quantity_on_hand >= $1
-               AND i.quantity_on_hand - $1 >= COALESCE((
-                 SELECT safety_stock_qty FROM facility_safety_stock safety
-                 WHERE safety.facility_id = i.facility_id AND safety.medicine_id = b.medicine_id
-               ), 0)
-             RETURNING i.inventory_id`,
-            [transfer.quantity, transfer.fromFacilityId, transfer.batchId, transfer.medicineId, this.config.simulationDate, plan.horizonDays]
-          );
-          if (stockResult.rowCount !== 1) throw new AppError(409, 'PLAN_STOCK_CHANGED', 'The donor stock changed after this plan was generated. Re-run the optimizer and review the new conditions.');
-        }
         const transferResult = await client.query(
           `INSERT INTO transfers (plan_id, origin_facility_id, destination_facility_id, medicine_id, batch_id, quantity,
                                   status, rejection_reason, approved_at, approved_by, note)

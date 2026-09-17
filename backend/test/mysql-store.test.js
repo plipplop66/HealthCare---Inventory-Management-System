@@ -81,14 +81,24 @@ test('MySQL quantity precision rejects a fractional count and more than two deci
   await liquidStore.assertQuantityPrecision('7', 3.12);
 });
 
-function decisionPlan() {
+function decisionPlan(transfers = [[14, 'TN-007-B01-26', 40]], fromFacilityId = 'WH-001') {
   return {
-    id: 'plan-atomic-001', horizonDays: 14,
-    transfers: [{ fromFacilityId: 'WH-001', toFacilityId: 'PHC-001', medicineId: '7', batchId: 14, quantity: 40 }]
+    id: 'plan-atomic-001', horizonDays: 14, medicine: { id: '7' },
+    transfers: transfers.map(([batchId, batchNo, quantity]) => ({
+      fromFacilityId, toFacilityId: 'PHC-001', medicineId: '7', batchId, batchNo, quantity, departureDay: 1, arrivalDay: 1
+    }))
   };
 }
 
-test('MySQL approval reserves donor stock, transfer item, and audit in one transaction', async () => {
+// WH-001 holds one 5000 mL batch. DH-MDU-001 holds two batches (600 + 900 mL usable) and keeps 1000 mL of safety stock.
+const DONOR_ROWS = [
+  { inventoryId: 11, facilityCode: 'WH-001', batchId: 14, batchNo: 'TN-007-B01-26', status: 'AVAILABLE', quarantined: 0, expiryDate: '2028-02-29', quantity: 5000 },
+  { inventoryId: 31, facilityCode: 'DH-MDU-001', batchId: 21, batchNo: 'LOT-A', status: 'AVAILABLE', quarantined: 0, expiryDate: '2028-02-29', quantity: 600 },
+  { inventoryId: 32, facilityCode: 'DH-MDU-001', batchId: 22, batchNo: 'LOT-B', status: 'AVAILABLE', quarantined: 0, expiryDate: '2028-04-24', quantity: 900 },
+  { inventoryId: 33, facilityCode: 'DH-MDU-001', batchId: 22, batchNo: 'LOT-B', status: 'QUARANTINED', quarantined: 0, expiryDate: '2028-04-24', quantity: 300 }
+];
+
+function transactionStore({ updateRows = 1, rows = DONOR_ROWS } = {}) {
   const calls = [];
   const connection = {
     async beginTransaction() { calls.push('BEGIN'); },
@@ -98,47 +108,87 @@ test('MySQL approval reserves donor stock, transfer item, and audit in one trans
     async query(sql, values) {
       calls.push({ sql, values });
       if (sql.includes('UPDATE plans')) return [{ affectedRows: 1 }];
-      if (sql.includes('UPDATE inventory i')) return [{ affectedRows: 1 }];
+      if (sql.includes('FOR UPDATE OF i')) return [rows.filter((row) => values[0].includes(row.facilityCode))];
+      if (sql.includes('FROM facility_safety_stock')) return [[{ facilityCode: 'DH-MDU-001', safetyStock: 1000 }].filter((row) => values[0].includes(row.facilityCode))];
+      if (sql.includes('UPDATE inventory i')) return [{ affectedRows: updateRows }];
       if (sql.includes('INSERT INTO transfers')) return [{ affectedRows: 1, insertId: 91 }];
       if (sql.includes('INSERT INTO audit_events')) return [{ insertId: 101 }];
       throw new Error(`Unexpected transaction query: ${sql.slice(0, 80)}`);
     }
   };
-  const store = createMysqlStore(config, { pool: { async getConnection() { return connection; }, async end() {} } });
-  const result = await store.recordPlanDecision({
-    plan: decisionPlan(), decision: 'APPROVE', actor: 'Approver <approver@example.test>', note: 'Reserve approved stock.',
-    beforeState: { status: 'PROPOSED' }, afterState: { status: 'RESERVED' }
-  });
+  const pool = {
+    async getConnection() { return connection; },
+    async query(sql, values) {
+      if (sql.includes('FROM inventory i') && !sql.includes('FOR UPDATE')) return [rows.filter((row) => values[0].includes(row.facilityCode))];
+      throw new Error(`Unexpected query: ${sql.slice(0, 80)}`);
+    },
+    async end() {}
+  };
+  return { calls, store: createMysqlStore(config, { pool }) };
+}
+
+const approve = (store, plan, extra = {}) => store.recordPlanDecision({
+  plan, decision: 'APPROVE', actor: 'Approver <approver@example.test>', note: 'Reserve approved stock.',
+  beforeState: { status: 'PROPOSED' }, afterState: { status: 'RESERVED' }, ...extra
+});
+const sqlCalls = (calls, text) => calls.filter((item) => item.sql?.includes(text));
+
+test('MySQL approval reserves donor stock, transfer item, and audit in one transaction', async () => {
+  const { calls, store } = transactionStore();
+  const plan = decisionPlan();
+  const result = await approve(store, plan, { expectedDonorStock: await store.readDonorStock(plan) });
   assert.equal(result.planStatus, 'RESERVED');
   assert.deepEqual(calls.filter((item) => typeof item === 'string'), ['BEGIN', 'COMMIT', 'RELEASE']);
-  const stockUpdate = calls.find((item) => item.sql?.includes('UPDATE inventory i'));
-  assert.match(stockUpdate.sql, /i\.quantity_on_hand - \? >= COALESCE\(safety\.safety_stock_qty, 0\)/);
-  assert.deepEqual(stockUpdate.values, [40, 'WH-001', 14, '7', '2026-09-11', 13, 40, 40]);
+  const [lock] = sqlCalls(calls, 'FOR UPDATE OF i');
+  assert.deepEqual(lock.values, [['WH-001'], '7']);
+  assert.match(sqlCalls(calls, 'FROM facility_safety_stock')[0].sql, /FOR SHARE OF safety/);
+  const [stockUpdate] = sqlCalls(calls, 'UPDATE inventory i');
+  assert.doesNotMatch(stockUpdate.sql, /safety_stock_qty/);
+  assert.match(stockUpdate.sql, /b\.batch_number = \?/);
+  assert.deepEqual(stockUpdate.values, [40, 'WH-001', 14, 'TN-007-B01-26', '7', '2026-09-11', 14, 40]);
   assert.ok(calls.some((item) => item.sql?.includes('INSERT INTO transfers') && item.values[0] === 'plan-atomic-001'));
 });
 
+test('MySQL approval checks protected stock across a donor facility with two batches', async () => {
+  // 1500 mL usable (the quarantined row does not count); sending 400 keeps 1100 mL, although each row alone would not.
+  const accepted = transactionStore();
+  await approve(accepted.store, decisionPlan([[21, 'LOT-A', 300], [22, 'LOT-B', 100]], 'DH-MDU-001'));
+  assert.deepEqual(sqlCalls(accepted.calls, 'UPDATE inventory i').map((item) => item.values.slice(0, 4)), [
+    [300, 'DH-MDU-001', 21, 'LOT-A'], [100, 'DH-MDU-001', 22, 'LOT-B']
+  ]);
+
+  const refused = transactionStore();
+  await assert.rejects(approve(refused.store, decisionPlan([[21, 'LOT-A', 400], [22, 'LOT-B', 200]], 'DH-MDU-001')), (error) => {
+    assert.equal(error.code, 'PLAN_STOCK_CHANGED');
+    assert.deepEqual(error.details.failures, [
+      { fromFacilityId: 'DH-MDU-001', reason: 'DONOR_BELOW_PROTECTED_STOCK', usableStock: 1500, sent: 600, protectedStock: 1000 }
+    ]);
+    return true;
+  });
+  assert.deepEqual(sqlCalls(refused.calls, 'UPDATE inventory'), []);
+  assert.deepEqual(refused.calls.filter((item) => typeof item === 'string'), ['BEGIN', 'ROLLBACK', 'RELEASE']);
+});
+
+test('MySQL approval refuses changed donor stock and changed batch identity', async () => {
+  const plan = decisionPlan();
+  const before = await transactionStore().store.readDonorStock(plan);
+  const changed = transactionStore({ rows: DONOR_ROWS.map((row) => (row.inventoryId === 11 ? { ...row, quantity: 4999.99 } : row)) });
+  await assert.rejects(approve(changed.store, plan, { expectedDonorStock: before }),
+    (error) => error.details.failures[0].reason === 'DONOR_STOCK_CHANGED_DURING_REVALIDATION');
+  assert.deepEqual(sqlCalls(changed.calls, 'UPDATE inventory'), []);
+
+  const renamed = transactionStore();
+  await assert.rejects(approve(renamed.store, decisionPlan([[14, 'TN-007-B02-26', 40]])),
+    (error) => error.details.failures[0].reason === 'BATCH_NUMBER_MISMATCH');
+});
+
 test('MySQL stale stock rolls back without persisting a transfer or audit event', async () => {
-  const calls = [];
-  const connection = {
-    async beginTransaction() { calls.push('BEGIN'); },
-    async commit() { calls.push('COMMIT'); },
-    async rollback() { calls.push('ROLLBACK'); },
-    release() { calls.push('RELEASE'); },
-    async query(sql) {
-      calls.push(sql);
-      if (sql.includes('UPDATE plans')) return [{ affectedRows: 1 }];
-      if (sql.includes('UPDATE inventory i')) return [{ affectedRows: 0 }];
-      throw new Error(`Unexpected transaction query: ${sql.slice(0, 80)}`);
-    }
-  };
-  const store = createMysqlStore(config, { pool: { async getConnection() { return connection; }, async end() {} } });
-  await assert.rejects(
-    () => store.recordPlanDecision({ plan: decisionPlan(), decision: 'APPROVE', actor: 'Approver <approver@example.test>', note: 'Reserve.', beforeState: {}, afterState: {} }),
-    { code: 'PLAN_STOCK_CHANGED' }
-  );
+  const { calls, store } = transactionStore({ updateRows: 0 });
+  await assert.rejects(() => approve(store, decisionPlan()), { code: 'PLAN_STOCK_CHANGED' });
   assert.ok(calls.includes('ROLLBACK'));
-  assert.ok(!calls.some((item) => typeof item === 'string' && item.includes('INSERT INTO transfers')));
-  assert.ok(!calls.some((item) => typeof item === 'string' && item.includes('INSERT INTO audit_events')));
+  assert.ok(!calls.includes('COMMIT'));
+  assert.deepEqual(sqlCalls(calls, 'INSERT INTO transfers'), []);
+  assert.deepEqual(sqlCalls(calls, 'INSERT INTO audit_events'), []);
 });
 
 test('MySQL delivery adds the reserved batch to recipient inventory and audits it', async () => {
