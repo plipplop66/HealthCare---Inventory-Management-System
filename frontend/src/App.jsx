@@ -2,11 +2,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import './auth.css';
 import { Icon } from './components/Icon';
 import { AuthScreen } from './components/AuthScreen';
+import { SelectionBar } from './components/SelectionBar';
 import { Button, EmptyOrError } from './components/ui';
 import { medrippleApi, usingMockData } from './services/medrippleApi';
-import { noSafePlanOutcome } from './services/optimizationOutcome';
-import { createPlanSelection, loadSelectedPlan } from './services/planSelection';
-import { mapAudit, mapDashboard, mapFacilityDetail } from './services/viewModels';
+import { completeSelection } from './services/selection';
+import { createWorkspace } from './services/workspace';
 import { Dashboard } from './pages/Dashboard';
 import { FacilityDetail } from './pages/FacilityDetail';
 import { RippleSimulator } from './pages/RippleSimulator';
@@ -24,7 +24,6 @@ const navItems = [
 
 let sessionStore;
 try { sessionStore = typeof window === 'undefined' ? undefined : window.sessionStorage; } catch { /* Storage may be disabled. */ }
-const planSelection = createPlanSelection(sessionStore);
 
 function Shell({ active, onNavigate, children, menuOpen, setMenuOpen, dataLabel, user, onSignOut, facilityCount }) {
   const current = navItems.find(([id]) => id === active)?.[1] || 'dashboard';
@@ -48,16 +47,16 @@ function Shell({ active, onNavigate, children, menuOpen, setMenuOpen, dataLabel,
 }
 
 function App() {
+  const workspace = useMemo(() => createWorkspace({ api: medrippleApi, storage: sessionStore }), []);
   const [view, setView] = useState('dashboard');
   const [menuOpen, setMenuOpen] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [user, setUser] = useState(null);
   const [dashboard, setDashboard] = useState(null);
+  const [catalog, setCatalog] = useState(null);
   const [dashboardError, setDashboardError] = useState(null);
-  const [focus, setFocus] = useState(null);
-  const [horizonDays, setHorizonDays] = useState(14);
-  const [quantity, setQuantity] = useState('');
-  const [outcome, setOutcome] = useState(null);
+  const [selection, setSelectionState] = useState(() => workspace.selection.get());
+  const [assessment, setAssessment] = useState(null);
   const [assessError, setAssessError] = useState(null);
   const [busy, setBusy] = useState(false);
   const [page, setPage] = useState({ key: '', data: null, error: null });
@@ -65,12 +64,16 @@ function App() {
   const [message, setMessage] = useState('');
   const refreshing = useRef(false);
 
+  const updateSelection = (patch) => setSelectionState(workspace.selection.set(patch));
+
   const loadDashboard = async () => {
     if (refreshing.current) return;
     refreshing.current = true;
     try {
-      const [summary, facilities, medicines] = await Promise.all([medrippleApi.regionSummary(), medrippleApi.facilities(), medrippleApi.medicines()]);
-      setDashboard(mapDashboard(summary, facilities, medicines));
+      const loaded = await workspace.loadDashboard();
+      setDashboard(loaded.dashboard);
+      setCatalog(loaded.catalog);
+      setSelectionState(workspace.selection.set(completeSelection(workspace.selection.get(), loaded.catalog, loaded.dashboard)));
       setDashboardError(null);
     } catch (error) {
       if (error.status === 401) setUser(null);
@@ -94,56 +97,36 @@ function App() {
     return () => window.clearInterval(timer);
   }, [user]);
 
-  const target = useMemo(() => {
-    if (!dashboard) return null;
-    const id = focus?.facilityId || dashboard.earliestStockout?.facilityId || dashboard.rows[0]?.id;
-    const row = dashboard.rows.find((item) => item.id === id);
-    if (!row) return null;
-    return { facilityId: row.id, facilityName: row.name, medicineId: focus?.medicineId || row.medicineId, medicineName: row.medicine, unit: row.unit };
-  }, [dashboard, focus]);
+  // The latest assessment is restored by plan ID after a refresh; opening a page never re-optimizes.
+  useEffect(() => {
+    if (!user || assessment || !workspace.hasAssessment()) return;
+    workspace.loadAssessment().then(setAssessment).catch((error) => { if (error.status === 401) setUser(null); else setAssessError(error); });
+  }, [user]);
 
-  const pageKey = view === 'facility' && target ? `facility:${target.facilityId}:${target.medicineId}:${horizonDays}:${version}`
+  const pageKey = view === 'facility' && selection.facilityId && selection.medicineId ? `facility:${selection.facilityId}:${selection.medicineId}:${selection.horizonDays}:${version}`
     : view === 'plan' ? `plan:${version}` : view === 'audit' ? `audit:${version}` : '';
   useEffect(() => {
     if (!user || !pageKey) return undefined;
     let active = true;
     setPage({ key: pageKey, data: null, error: null });
-    const load = async () => {
-      if (view === 'facility') {
-        const inventory = await medrippleApi.inventory(target.facilityId, target.medicineId);
-        let forecast = null;
-        let forecastError = null;
-        try { forecast = await medrippleApi.forecast({ facilityId: target.facilityId, medicineId: target.medicineId, horizonDays }); } catch (error) {
-          if (error.status === 401) throw error;
-          forecastError = error;
-        }
-        return mapFacilityDetail({ inventory, forecast, forecastError, horizonDays });
-      }
-      if (view === 'plan') return loadSelectedPlan(planSelection, (id) => medrippleApi.plan(id));
-      return mapAudit(await medrippleApi.audit());
-    };
+    const load = view === 'facility' ? () => workspace.loadFacility(selection)
+      : view === 'plan' ? () => workspace.loadAssessment().then((result) => ({ assessment: result }))
+        : () => workspace.loadAudit();
     load().then((data) => { if (active) setPage({ key: pageKey, data, error: null }); })
       .catch((error) => { if (!active) return; if (error.status === 401) setUser(null); else setPage({ key: pageKey, data: null, error }); });
     return () => { active = false; };
   }, [user, pageKey]);
 
   const runAssessment = async () => {
-    const amount = Number(quantity);
-    if (!target || !Number.isFinite(amount) || amount <= 0) { setAssessError({ message: 'Enter a positive quantity.' }); return; }
+    const unit = catalog?.medicines.find((item) => item.id === selection.medicineId)?.unit;
     setBusy(true);
     setAssessError(null);
-    setOutcome(null);
-    planSelection.set(null);
+    setAssessment(null);
     try {
-      const plan = await medrippleApi.optimize({ destinationFacilityId: target.facilityId, medicineId: target.medicineId, quantity: amount, horizonDays });
-      planSelection.set({ planId: plan.data.id });
-      setOutcome({ plan });
+      setAssessment(await workspace.runAssessment(selection, unit));
     } catch (error) {
-      try {
-        const noSafe = noSafePlanOutcome(error, { horizon: horizonDays, quantity: amount });
-        planSelection.set(noSafe);
-        setOutcome(noSafe);
-      } catch (other) { setAssessError(other); }
+      if (error.status === 401) setUser(null);
+      else setAssessError(error);
     } finally { setBusy(false); }
   };
 
@@ -151,7 +134,7 @@ function App() {
     setBusy(true);
     setMessage('');
     try {
-      const { data } = await medrippleApi.decide(page.data.data.id, decision, note);
+      const { data } = await medrippleApi.decide(page.data.assessment.plan.data.id, decision, note);
       setMessage(`Plan is now ${data.plan.status}.`);
       setVersion((current) => current + 1);
     } catch (error) { setMessage(error.message); } finally { setBusy(false); }
@@ -161,7 +144,7 @@ function App() {
     setBusy(true);
     setMessage('');
     try {
-      const { data } = await medrippleApi.transition(page.data.data.id, action, note);
+      const { data } = await medrippleApi.transition(page.data.assessment.plan.data.id, action, note);
       setMessage(`Plan is now ${data.plan.status}.`);
       setVersion((current) => current + 1);
     } catch (error) { setMessage(error.message); } finally { setBusy(false); }
@@ -170,24 +153,31 @@ function App() {
   const onAuthenticated = (sessionUser) => { setView('dashboard'); setDashboard(null); setUser(sessionUser); };
   const onSignOut = async () => {
     await medrippleApi.logout();
-    planSelection.set(null);
+    workspace.reset();
+    setSelectionState(workspace.selection.get());
     setUser(null);
     setDashboard(null);
-    setOutcome(null);
+    setAssessment(null);
   };
-  const openFacility = (facilityId, medicineId) => { setFocus({ facilityId, medicineId }); setView('facility'); };
+  const openFacility = (facilityId, medicineId) => {
+    updateSelection(medicineId ? { facilityId, medicineId } : { facilityId });
+    setView('facility');
+  };
 
   const content = (() => {
     if (view === 'dashboard') return <Dashboard data={dashboard} onOpenFacility={openFacility} />;
     if (view === 'candidates') return <EmptyOrError title="No donor assessment yet" copy="Donor candidates come from the optimizer's assessment. Run the ripple simulator to see eligible and rejected donors." actionLabel="open ripple simulator" retry={() => setView('simulator')} />;
-    if (view === 'simulator') return <RippleSimulator target={target} horizonDays={horizonDays} quantity={quantity} onQuantity={setQuantity} onHorizon={setHorizonDays} onRun={runAssessment} busy={busy} outcome={outcome} error={assessError} onReview={() => setView('plan')} />;
-    if (page.key !== pageKey || (!page.data && !page.error)) return <p role="status">Loading {view} from the API…</p>;
-    if (page.error) return <EmptyOrError title="This section is unavailable" copy={page.error.message} retry={() => setVersion((current) => current + 1)} />;
-    if (view === 'facility') return <FacilityDetail data={page.data} onAssess={() => setView('simulator')} />;
+    if (view === 'simulator') return <RippleSimulator catalog={catalog} selection={selection} onSelection={updateSelection} onRun={runAssessment} busy={busy} assessment={assessment} error={assessError} onReview={() => setView('plan')} />;
+    const selectionBar = view === 'facility' && <SelectionBar catalog={catalog} selection={selection} onChange={updateSelection} showQuantity={false} />;
+    if (page.key !== pageKey || (!page.data && !page.error)) return <>{selectionBar}<p role="status">Loading {view} from the API…</p></>;
+    if (page.error) return <>{selectionBar}<EmptyOrError title="This section is unavailable" copy={page.error.message} retry={() => setVersion((current) => current + 1)} /></>;
+    if (view === 'facility') return <>{selectionBar}<FacilityDetail data={page.data} onAssess={() => setView('simulator')} /></>;
     if (view === 'plan') {
-      if (page.data.noSelectedPlan) return <EmptyOrError title="Select a plan to review" copy="Run a safety assessment in the ripple simulator first. Opening this page never creates a plan." actionLabel="open ripple simulator" retry={() => setView('simulator')} />;
-      if (page.data.noSafePlan) return <EmptyOrError title="Your latest assessment found no safe plan" copy="No transfer can be approved. Open the simulator for capacity and reasons." actionLabel="open ripple simulator" retry={() => setView('simulator')} />;
-      return <PlanReview key={page.data.data.id} plan={page.data} canDecide={['APPROVER', 'ADMIN'].includes(user?.role)} busy={busy} onDecision={decide} onLifecycle={transition} message={message} />;
+      const selected = page.data.assessment;
+      if (!selected) return <EmptyOrError title="Select a plan to review" copy="Run a safety assessment in the ripple simulator first. Opening this page never creates a plan." actionLabel="open ripple simulator" retry={() => setView('simulator')} />;
+      if (selected.kind === 'MISSING') return <EmptyOrError title="The selected plan is no longer available" copy="Run a new assessment in the ripple simulator." actionLabel="open ripple simulator" retry={() => setView('simulator')} />;
+      if (selected.kind === 'NO_SAFE_PLAN') return <EmptyOrError title="Your latest assessment found no safe plan" copy="No transfer can be approved. Open the simulator for capacity and reasons." actionLabel="open ripple simulator" retry={() => setView('simulator')} />;
+      return <PlanReview key={selected.plan.data.id} plan={selected.plan} canDecide={['APPROVER', 'ADMIN'].includes(user?.role)} busy={busy} onDecision={decide} onLifecycle={transition} message={message} />;
     }
     return <AuditTrail data={page.data} />;
   })();
@@ -195,7 +185,7 @@ function App() {
   if (!authReady) return <div className="app-state"><Icon name="ripple" size={28} /><strong>loading medripple</strong><span>checking your session…</span></div>;
   if (!user) return <AuthScreen api={medrippleApi} onAuthenticate={onAuthenticated} />;
   if (dashboardError && !dashboard) return <div className="app-state"><EmptyOrError title="regional workspace unavailable" copy={dashboardError.message} retry={loadDashboard} /><Button onClick={onSignOut}>sign out</Button></div>;
-  if (!dashboard) return <div className="app-state"><Icon name="ripple" size={28} /><strong>loading medripple</strong><span>reading the regional snapshot from the API…</span></div>;
+  if (!dashboard || !catalog) return <div className="app-state"><Icon name="ripple" size={28} /><strong>loading medripple</strong><span>reading the regional snapshot from the API…</span></div>;
   return <Shell active={view} onNavigate={setView} menuOpen={menuOpen} setMenuOpen={setMenuOpen} dataLabel={dashboard.dataFreshness} facilityCount={dashboard.facilitiesMonitored} user={user} onSignOut={onSignOut}>
     {content}
   </Shell>;

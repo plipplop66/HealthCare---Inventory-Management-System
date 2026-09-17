@@ -213,3 +213,7 @@ tbody tr:hover td { background: rgb(255 255 255 / .025); }
 .assessment-form .horizon-switch { margin-left: 0; }
 .plain-list { margin: 8px 0 0; padding-left: 18px; color: #e2e8f0; font-size: 12px; line-height: 1.6; }
 .audit-hidden { margin: 10px 0 0; font-size: 11px; }
+.selection-bar { margin-bottom: 16px; }
+.selection-bar { flex-direction: column; align-items: stretch; }
+.horizon-field { display: grid; gap: 4px; color: var(--mr-muted); font-size: 11px; }
+.field-error { margin: 8px 0 0; color: var(--mr-danger); font-size: 12px; }
