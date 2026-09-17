@@ -187,54 +187,39 @@ These checks read data only. Do **not** call these in production without separat
 
 Signing in updates only the account's `last_login_at`.
 
-1. **API and intelligence service.** The intelligence service only reads the database, so these requests save nothing.
+1. **Automated checks:**
 
    ```bash
-   API=https://health-care-inventory-management-sy-ecru.vercel.app
-   AI=https://medripple-intelligence.vercel.app
-   WEB=https://frontend-psi-plum-56.vercel.app
-   INSULIN=med-insulin-100iu-vial
-   curl -sS -o /dev/null -w '%{http_code}\n' "$API/api/facilities"                       # 401
-   for from in "$WEB" https://unlisted-origin.example; do                                # prints only the frontend origin
-     curl -sS -o /dev/null -D - -X OPTIONS -H "Origin: $from" -H 'Access-Control-Request-Method: GET' "$API/api/region/summary" | grep -i '^access-control-allow-origin'
-   done
-   post() { curl -sS -w '\nHTTP %{http_code}\n' -X POST -H 'content-type: application/json' "$AI$1" -d "$2"; }
-   post /forecast "{\"facilityId\":\"PHC-VLR-001\",\"medicineId\":\"$INSULIN\",\"horizonDays\":14}"
-   post /plans/optimize "{\"destinationFacilityId\":\"PHC-VLR-001\",\"medicineId\":\"$INSULIN\",\"quantity\":300,\"horizonDays\":14}"
-   post /plans/optimize "{\"destinationFacilityId\":\"PHC-KRR-001\",\"medicineId\":\"$INSULIN\",\"quantity\":800,\"horizonDays\":14}"
-   post /plans/optimize "{\"destinationFacilityId\":\"PHC-KRR-001\",\"medicineId\":\"$INSULIN\",\"quantity\":1300,\"horizonDays\":14}"
-   post /scenarios/simulate "{\"horizonDays\":14,\"transfers\":[{\"fromFacilityId\":\"PHC-TNJ-001\",\"toFacilityId\":\"PHC-KRR-001\",\"medicineId\":\"$INSULIN\",\"quantity\":50,\"arrivalDay\":1},{\"fromFacilityId\":\"WH-TN-001\",\"toFacilityId\":\"PHC-KRR-001\",\"medicineId\":\"$INSULIN\",\"quantity\":50,\"arrivalDay\":1}]}"
-   ```
-
-   | Request | Expected |
-   | --- | --- |
-   | forecast | HTTP 200, `risk.label` `CRITICAL`, `dataContext.dataSource` `POSTGRES` |
-   | Vellore 300 mL | HTTP 200, `status` `PROPOSED`, `requiresHumanApproval` true, one transfer `WH-TN-001` batch `TN-007-B01-26` quantity 300 |
-   | Karur 800 mL | HTTP 200, transfers `DH-CBE-001` 167.59 and `DH-MDU-001` 632.41, both batch `TN-007-B01-26` |
-   | Karur 1300 mL | HTTP 422, `NO_SAFE_PLAN`, `safeCapacity` 1236.9, `unmetQuantity` 63.1 |
-   | simulation | HTTP 200, rejection codes `COLD_CHAIN_UNAVAILABLE` (Thanjavur) and `TRAVEL_TIME_LIMIT_EXCEEDED` (warehouse, 7.73 h), `comparison.safeToRecommend` false |
-
-2. **Authenticated reads** with an existing account:
-   1. Sign in on the website.
-   2. Run `copy(localStorage.getItem('medripple.session'))` in the browser console.
-   3. Paste the token at the silent prompt below.
-
-   ```bash
-   read -rsp 'Session token: ' SMOKE_TOKEN; echo
-   for path in /auth/me /region/summary /facilities /medicines "/facilities/PHC-VLR-001/inventory?medicineId=$INSULIN" /audit; do
-     curl -sS -o "$OUT/smoke$(printf %s "$path" | tr -c 'a-zA-Z0-9' '-').json" -w "HTTP %{http_code} $path\n" -H "Authorization: Bearer $SMOKE_TOKEN" "$API/api$path"
-   done
+   export SMOKE_BACKEND_URL=https://health-care-inventory-management-sy-ecru.vercel.app
+   export SMOKE_INTELLIGENCE_URL=https://medripple-intelligence.vercel.app
+   export SMOKE_FRONTEND_URL=https://frontend-psi-plum-56.vercel.app
+   # Optional authenticated reads: sign in to the website with an existing account, run
+   # copy(localStorage.getItem('medripple.session')) in the browser console, then paste at this silent prompt.
+   read -rsp 'Session token (Enter to skip): ' SMOKE_TOKEN; echo; export SMOKE_TOKEN
+   node backend/scripts/release-smoke.js | tee "$OUT/smoke.txt"
    unset SMOKE_TOKEN
    ```
 
-   Every request returns HTTP 200, and the saved responses show:
-   - the region summary has exactly `resilienceScore`, `earliestStockout`, `criticalFacilityCount`, `alerts` and `dataFreshness` (`SIMULATED DATABASE`);
-   - 16 facilities, all Human Insulin;
-   - at least 12 medicines;
-   - Vellore batches `TN-007-*`;
-   - audit timestamps ending in `Z`.
+   The script (`backend/scripts/release-smoke.js`) sends only GET and CORS preflight requests to the API, and never prints the token. It calls the intelligence service directly for forecasts, simulations and plans. The service only reads the database, so nothing is saved. The script expects:
+   - API health `POSTGRES` with the database connected;
+   - `401` on `/api/facilities` without a token;
+   - CORS open to the frontend origin only;
+   - the Vellore forecast `CRITICAL`;
+   - Vellore 300 mL → `WH-TN-001 TN-007-B01-26 300`;
+   - Karur 800 mL → `DH-CBE-001` 167.59 + `DH-MDU-001` 632.41;
+   - Karur 1300 mL → `422 NO_SAFE_PLAN`, safe capacity 1236.9;
+   - `COLD_CHAIN_UNAVAILABLE` and `TRAVEL_TIME_LIMIT_EXCEEDED` rejections;
+   - a frontend bundle that uses this API and contains no database settings.
 
-3. **Browser** (read-only), signed in with an existing account:
+   With a token, it also checks:
+   - the session;
+   - a region summary without any patient-impact field;
+   - 16 insulin facilities;
+   - at least 12 medicines;
+   - Vellore inventory;
+   - audit timestamps as ISO-8601 UTC instants.
+
+2. **Browser** (read-only), signed in with an existing account:
    - The dashboard shows the resilience score, earliest stockout, critical count and "Facilities monitored" (16), for insulin.
    - Facility detail for `PHC-VLR-001` shows batches and an intelligence-service forecast. Switching the medicine updates the page.
    - The audit trail lists events, and their times read correctly in local time: an event recorded at 06:30 UTC shows 12:00 in India.
