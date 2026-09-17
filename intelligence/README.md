@@ -9,7 +9,7 @@ A standalone Python FastAPI service that forecasts medicine demand, projects sto
 - **Ripple Simulator:** `POST /scenarios/simulate` projects every facility before and after proposed transfers, with the same forecast and projection, and says whether they are safe to recommend. See [Ripple Simulator](#ripple-simulator-post-scenariossimulate).
 - **Transfer optimizer:** `POST /plans/optimize` proposes the smallest safe multi-source plan for a requested quantity, using OR-Tools CP-SAT. The Ripple Simulator validates every plan before it is returned. See [Transfer optimizer](#transfer-optimizer-post-plansoptimize).
 
-The HTTP service reads the offline Navjeevan PHC fixture, Dhiren's MySQL database, or the same dataset in PostgreSQL (see [Data sources](#data-sources)). All three use the same calculation code, so they always return the same numbers for the same data. Day 1 is intentionally transparent: a weighted moving average and simple rules, with no deep learning, LLMs or randomness.
+The HTTP service reads the offline Navjeevan PHC fixture, Dhiren's MySQL database, or PostgreSQL holding Dhiren's dataset plus the final demo scenarios (see [Data sources](#data-sources)). All three use the same calculation code, so they always return the same numbers for the same data. Day 1 is intentionally transparent: a weighted moving average and simple rules, with no deep learning, LLMs or randomness.
 
 ## Quick start
 
@@ -47,7 +47,7 @@ If `pip install` fails with `CERTIFICATE_VERIFY_FAILED`, the venv's pip is proba
 | --- | --- | --- | --- |
 | `fixture` (default) | Offline Navjeevan PHC fixture (`app/data_store.py`, `data/simulated_consumption.csv`) | `facility-navjeevan-phc` and three others; `med-insulin-100iu-vial` | `vial` |
 | `mysql` | Only Dhiren's MySQL database (`database/schema.sql` and `golden-scenario.sql`), read-only | `facilities.facility_code` (e.g. `PHC-VLR-001`) or the numeric `facility_id`; the numeric `medicine_id` (e.g. `7`) or the documented alias `med-insulin-100iu-vial` | The medicine's base unit (`mg`, `mL` or `count`), decimals kept |
-| `postgres` | The same dataset in PostgreSQL (Supabase for the Vercel deployment) through `DATABASE_URL`, read-only, with the same queries and interpretation rules as `mysql` | As `mysql` | As `mysql` |
+| `postgres` | PostgreSQL (Supabase for the Vercel deployment) through `DATABASE_URL`, read-only, with the same queries and interpretation rules as `mysql`. `database/seed-postgres.sql` holds Dhiren's dataset plus the final demo scenarios; see `database/README.md` | As `mysql` | As `mysql` |
 
 In `mysql` and `postgres` mode the service never uses fixture data: fixture IDs return 404, and if the database cannot be reached `POST /forecast` returns 503 `DATABASE_UNAVAILABLE`. PostgreSQL connections verify the server certificate (`sslmode=verify-full`, with `certs/supabase-ca.crt` for Supabase hosts) and run in a read-only transaction. `dataContext.dataSource` is `POSTGRES`, and the reviewed transfer rules and mapping statuses are identical to `mysql`.
 
@@ -105,6 +105,10 @@ $env:MEDRIPPLE_LIVE_MYSQL = "1"; $env:DATABASE_PASSWORD = "medripple_dev_only"
 ```
 
 Run only the simulator tests with `.\.venv\Scripts\python -m pytest tests/test_simulator.py tests/test_simulator_api.py`, and only the optimizer tests with `.\.venv\Scripts\python -m pytest tests/test_optimizer.py tests/test_optimizer_api.py`.
+
+The PostgreSQL demo dataset is checked by two modules:
+- `tests/test_postgres_demo_dataset.py` always runs and needs no database.
+- `tests/test_postgres_demo_live.py` runs only with `MEDRIPPLE_LIVE_POSTGRES=1` and a local `DATABASE_URL`; see `database/README.md`.
 
 ## Day 1: `analyse_shortage(facility_data)`
 
@@ -781,20 +785,24 @@ The MySQL seed (10 facilities, 12 medicines, 75 days of consumption) is now read
 
 ### Demo data limitations for the optimizer
 
-With the six-hour route cap and received-stock-only donor capacity, the seed supports few safe plans. On the 14-day horizon only `WH-TN-001` has safe donor capacity for insulin, and it is within six hours only of `PHC-VLR-001` (3.19 h). Most other destinations therefore return `NO_SAFE_PLAN`: their donors are too far away, lack a cold chain, or are safe only because of scheduled deliveries.
+With the six-hour route cap and received-stock-only donor capacity, the MySQL seed supports few safe plans. On the 14-day horizon only `WH-TN-001` has safe donor capacity for insulin, and it is within six hours only of `PHC-VLR-001` (3.19 h). Most other destinations therefore return `NO_SAFE_PLAN`: their donors are too far away, lack a cold chain, or are safe only because of scheduled deliveries.
 
-This is the intended result on this data. The rules are not relaxed and the service never edits the data to produce more plans. Dhiren owns the follow-up seed additions:
-- one more donor route under six hours;
-- a clinical donor that stays safe without any incoming replenishment;
-- a valid two-donor scenario;
-- a deliberately unsafe donor;
+This is the intended result on this data. The rules are not relaxed and the service never edits the data to produce more plans.
+
+The PostgreSQL demo dataset (`database/seed-postgres.sql`, or migration 005 for an existing database) adds the scenarios this follow-up asked for, using simulated data only:
+- a donor route under six hours and one of exactly six hours;
+- a clinical donor that stays safe without incoming replenishment;
+- a valid two-donor plan;
+- deliberately unsafe donors;
 - a cold-chain failure.
+
+See `database/README.md`. The MySQL seed itself is unchanged.
 
 ## Node backend integration
 
 The Express API now proxies `/forecast` and `/scenarios/simulate` to this service when `INTELLIGENCE_SERVICE_URL` is configured. It passes deliberate 4xx intelligence errors through to callers and uses its own simulator only when the service times out or is unavailable. `optimisePlan` keeps its database-selected `batchId` for approval persistence, then evaluates the selected transfers through this service when available.
 
-`compose.yaml` runs MySQL, this service, and the Node backend together. It sets `INTELLIGENCE_SERVICE_URL=http://intelligence:8000`; backend MySQL DATE values are deliberately returned as `YYYY-MM-DD` strings so timezone conversion cannot alter a replenishment date.
+`compose.yaml` runs MySQL, this service, and the Node backend together. It sets `INTELLIGENCE_SERVICE_URL=http://intelligence:8000`; backend MySQL DATE values are deliberately returned as `YYYY-MM-DD` strings so timezone conversion cannot alter a replenishment date. The backend PostgreSQL store returns DATE values the same way.
 
 The optimiser is served as `POST /plans/optimize`. The Node integration passes the validated request to this service when it is healthy, preserves its selected database batch IDs for audit persistence, and labels the existing Node optimiser as a fallback only when the intelligence service is unavailable. Deliberate validation and no-safe-plan responses remain visible to the caller rather than being silently converted to a fallback recommendation.
 

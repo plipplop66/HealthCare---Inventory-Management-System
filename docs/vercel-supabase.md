@@ -64,8 +64,14 @@ the project's Database Settings download. Its SHA-256 fingerprint is
 `schema-postgres.sql` is an **initialization/reset script with DROP statements**.
 Never rerun it on the deployed database. The live schema already exists.
 
-- `database/seed-postgres.sql` is additive: conflicts do not reset inventory or
-  overwrite accounts, plans, or audits. It contains no public approver account.
+- `database/seed-postgres.sql` is the fresh-install seed for a new database: the
+  final demo dataset with fixed IDs (see `database/README.md`). It refuses to run
+  where those IDs already belong to other rows, as on the deployed database, and
+  it contains no public approver account.
+- `database/migrations/005_expand_final_demo_scenarios_postgres.sql` adds the same
+  dataset to an existing database. It is insert-only and never resets inventory
+  or touches accounts, plans, transfers or audits. It has not been applied to the
+  deployed database; doing so is a separate owner-approved change.
 - `database/secure-supabase.sql` enables RLS and revokes direct table privileges
   from `anon` and `authenticated`. Only server-side SQL clients access tables.
 - Do not grant direct browser access to `app_users` or audit/transfer tables.
