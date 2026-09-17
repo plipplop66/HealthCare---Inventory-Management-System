@@ -63,7 +63,7 @@ Environment variables use the names in `backend/src/config.js`. This service doe
 
 `DATABASE_URL` is rejected at startup in `mysql` mode, so the service cannot silently connect to a different database than configured, and `postgres` mode refuses to start without it.
 
-Run against the database started by `pnpm db:up` (PowerShell):
+Run against the database started by `npm run db:up` (PowerShell):
 
 ```powershell
 $env:DATA_SOURCE = "mysql"; $env:DATABASE_PASSWORD = "medripple_dev_only"
@@ -179,12 +179,10 @@ Invalid input raises `ValueError` naming the field. Fewer than 14 valid daily re
 
 1. Start this service on port 8000 with the same `DATA_SOURCE` as the backend (for `mysql`, also the same database settings and `SIMULATION_DATE`).
 2. In the repository root `.env` (copied from `.env.example`), set `INTELLIGENCE_SERVICE_URL=http://127.0.0.1:8000`.
-3. From the repository root, run `pnpm dev`.
+3. From the repository root, run `npm run dev`.
 4. `POST http://127.0.0.1:3001/api/forecast` now returns `meta.source: "INTELLIGENCE_SERVICE"` and `meta.fallback: false`, for example with `{"facilityId": "PHC-VLR-001", "medicineId": "7", "horizonDays": 14}` in MySQL mode.
 
-If this service is stopped, slower than `INTELLIGENCE_TIMEOUT_MS` (default 2500 ms), or returns a 5xx status, the Node adapter falls back to its own labelled forecast (`FIXTURE_FALLBACK`, or `DATABASE_FALLBACK` with a database). This service's deliberate 4xx answers, such as `NO_CONSUMPTION_HISTORY` for a warehouse, are passed through to the caller instead; see [Node backend integration](#node-backend-integration).
-
-This directory is deliberately **not** a pnpm workspace member. pnpm members must be Node packages, and adding one changes `pnpm-lock.yaml`, which CI installs with `--frozen-lockfile`. The Python commands above are kept separate.
+If this service is stopped, slower than `INTELLIGENCE_TIMEOUT_MS` (default 2500 ms), or returns a 5xx status, only the forecast falls back, to a labelled estimate (`FIXTURE_FALLBACK`, or `DATABASE_FALLBACK` with a database). With a database, simulation, optimization and approval fail closed instead; see [Node backend integration](#node-backend-integration). This service's deliberate 4xx answers, such as `NO_CONSUMPTION_HISTORY` for a warehouse, are passed through to the caller.
 
 ## API
 
@@ -817,11 +815,24 @@ See `database/README.md`. The MySQL seed itself is unchanged.
 
 ## Node backend integration
 
-The Express API now proxies `/forecast` and `/scenarios/simulate` to this service when `INTELLIGENCE_SERVICE_URL` is configured. It passes deliberate 4xx intelligence errors through to callers and uses its own simulator only when the service times out or is unavailable. `optimisePlan` keeps its database-selected `batchId` for approval persistence, then evaluates the selected transfers through this service when available.
+The Express API (`backend/src/intelligence-adapter.js`) sends `/forecast`, `/scenarios/simulate` and `/plans/optimize` to this service when `INTELLIGENCE_SERVICE_URL` is configured. With a database (MySQL or PostgreSQL) this service is the only authority for simulation, optimization and approval safety:
+
+| Backend route | This service answers | Stopped, slower than `INTELLIGENCE_TIMEOUT_MS`, 5xx or invalid response |
+| --- | --- | --- |
+| `POST /api/forecast` | Its forecast (`INTELLIGENCE_SERVICE`) | Labelled `DATABASE_FALLBACK` estimate with `fallbackReason`; informational only |
+| `POST /api/scenarios/simulate` | Its simulation, unchanged | `503 INTELLIGENCE_UNAVAILABLE`, `INTELLIGENCE_TIMEOUT` or `INVALID_INTELLIGENCE_RESPONSE`; no local simulation |
+| `POST /api/plans/optimize` | Its `PROPOSED` plan, persisted with the same ID, transfers, batch IDs, candidates, validation and context | The same `503` codes; nothing persisted |
+| `POST /api/plans/:id/approve` | See below | The same `503` codes; nothing reserved |
+
+Deliberate 4xx answers (`NO_SAFE_PLAN` with its details, validation, not found, quantity precision) keep their status, code, message and details. The backend checks every response's shape (one evaluation per submitted transfer, a boolean `safeToRecommend`; for a plan, the requested medicine, destination, quantity and horizon, a batch on every transfer, a safe simulation with a passing `receivedStockCheck`, and `requiresHumanApproval`).
+
+**Approval revalidation.** Approving a stored `PROPOSED` plan never regenerates it and never calls `/plans/optimize`. The backend sends the plan's exact transfers (with `batchId`, `batchNo` and `departureDay`, which this service ignores) to `/scenarios/simulate` with the plan's horizon, and reserves stock only if the response shows the same data source, horizon, medicine, transfers and total; every transfer eligible and applied; `safeToRecommend`; no new shortage or risk; routes of at most 6 hours; the cold chain kept; the planned batches unchanged; and a passing [received-stock donor check](#received-stock-donor-evidence) for every donor. Otherwise it returns `409 PLAN_REVALIDATION_FAILED` with the failed checks, rejected transfers, codes, reasons, new shortages and unsafe donors, and asks for a new plan. The database transaction then remains the final concurrency guard: it locks the donors' inventory rows, requires them unchanged since revalidation, checks the exact batch and facility-level protected stock, and reserves conditionally on `PROPOSED` (`409 PLAN_STOCK_CHANGED` or `PLAN_ALREADY_DECIDED` roll everything back). Rejecting a plan needs no call to this service. See `docs/api-contract.md`.
+
+Fixture mode (no database) keeps a development fallback: when this service is unavailable, the Node simulator and planner answer, labelled `FIXTURE_FALLBACK` with `isFallback` and `fallbackReason`. Fixture approvals reserve nothing and report `revalidation.performed: false`; they are not evidence of production safety.
 
 `compose.yaml` runs MySQL, this service, and the Node backend together. It sets `INTELLIGENCE_SERVICE_URL=http://intelligence:8000`; backend MySQL DATE values are deliberately returned as `YYYY-MM-DD` strings so timezone conversion cannot alter a replenishment date. The backend PostgreSQL store returns DATE values the same way.
 
-The optimiser is served as `POST /plans/optimize`. The Node integration passes the validated request to this service when it is healthy, preserves its selected database batch IDs for audit persistence, and labels the existing Node optimiser as a fallback only when the intelligence service is unavailable. Deliberate validation and no-safe-plan responses remain visible to the caller rather than being silently converted to a fallback recommendation.
+`backend/test/postgres-approval-live.test.js` runs the whole flow against a disposable local PostgreSQL database and this service in `postgres` mode (see its header): the Vellore golden plan is revalidated and reserved, and unsafe routes, cold chain, future-supply and unsafe donors, a stopped or slow service and a stock race all leave the database unchanged.
 
 ## Layout
 

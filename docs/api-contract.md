@@ -24,9 +24,18 @@ Every failure is shaped as:
 }
 ```
 
-`source` is important: `FIXTURE_*` means deterministic simulated data; `DATABASE_FALLBACK` means the active MySQL records were used while the intelligence service was unavailable; `INTELLIGENCE_SERVICE` means Druv's live service answered. Any fallback forecast is usable for integration only, not a release result.
+`source` is important: `INTELLIGENCE_SERVICE` means Druv's live service answered; `FIXTURE_STORE` means deterministic simulated fixture data; `FIXTURE_FALLBACK` means the fixture used the local Node rules because the service was unavailable (development only); `DATABASE_FALLBACK` means a forecast was estimated from the active database records while the service was unavailable. Fallback results carry `isFallback: true`, a `fallbackReason` and `meta.fallback: true`. They are usable for integration only, not a release result, and are never used for approval.
 
-When `DATA_SOURCE=mysql`, inventory, optimization, approval, lifecycle, and audit routes use Dhiren's seeded MySQL database. In this mode, an unavailable FastAPI optimizer returns `503 INTELLIGENCE_UNAVAILABLE`; it never falls back to the simpler Node planner to create an inventory-reserving plan. Facility IDs are stable database `facility_code` values such as `PHC-VLR-001`; medicine IDs are database medicine IDs, while the fixture alias `med-insulin-100iu-vial` remains accepted for the default insulin view.
+With a database (`DATA_SOURCE=mysql`, or PostgreSQL through `DATABASE_URL`), inventory, optimization, approval, lifecycle and audit routes use that database, and the intelligence service is the only authority for simulation, optimization and approval safety:
+
+| Route | Service unavailable, slow or invalid |
+| --- | --- |
+| `POST /api/forecast` | `200` labelled `DATABASE_FALLBACK` forecast (informational) |
+| `POST /api/scenarios/simulate` | `503`; no local simulation, nothing saved |
+| `POST /api/plans/optimize` | `503`; no local plan, nothing saved |
+| `POST /api/plans/:planId/approve` (`APPROVE`) | `503`; nothing reserved |
+
+The service's deliberate `4xx` answers (`NO_SAFE_PLAN`, validation, not found, quantity precision) keep their status, code, message and `details`. Only a network failure, timeout (`INTELLIGENCE_TIMEOUT_MS`, default 2500 ms), invalid response or `5xx` becomes a `503`. Facility IDs are stable database `facility_code` values such as `PHC-VLR-001`; medicine IDs are database medicine IDs, while the fixture alias `med-insulin-100iu-vial` remains accepted for the default insulin view.
 
 ## Authentication and access control
 
@@ -120,7 +129,7 @@ one letter, and one number. Login accepts `email` and `password`. Both return:
 }
 ```
 
-Each returned `transferEvaluation` includes `eligible`, `rejectionReasons`, and route details. Clients must display rejected reasons rather than treating an ineligible transfer as a recommendation.
+Each returned `transferEvaluation` includes `eligible`, `rejectionReasons`, and route details. Clients must display rejected reasons rather than treating an ineligible transfer as a recommendation. With a database the response is the intelligence service's own simulation, including `comparison.safeToRecommend`, `maxTravelHours`, batch IDs and the `receivedStockCheck` donor evidence; Node does not add or override a safety decision.
 
 ### Ask for a plan
 
@@ -133,7 +142,7 @@ Each returned `transferEvaluation` includes `eligible`, `rejectionReasons`, and 
 }
 ```
 
-The return includes a deterministic `id`, `status`, `transfers`, `rationale`, `assumptions`, and a full `simulation`. MySQL-mode plans are persisted by `plan_id`; the transfer items reference that plan and its exact batch IDs.
+The return includes a deterministic `id`, `status`, `transfers`, `rationale`, `assumptions`, and a full `simulation`. With a database, the plan is the intelligence service's `PROPOSED` plan exactly as returned (ID, transfers, batch IDs and numbers, candidates, validation, context and model version) and is persisted by `plan_id`; the backend never recreates the ID. It rejects a plan that is not for the requested medicine, destination, quantity and horizon, has no batch for a transfer, is not simulated safe with a passing `receivedStockCheck`, or does not require human approval (`503 INVALID_INTELLIGENCE_RESPONSE`).
 
 ### Record a human decision
 
@@ -144,7 +153,43 @@ The return includes a deterministic `id`, `status`, `transfers`, `rationale`, `a
 }
 ```
 
-`decision` must be `APPROVE` or `REJECT`. In MySQL mode an approval atomically creates transfer items, deducts the donor's available batch quantity subject to a safety-stock conditional update, changes the plan to `RESERVED`, and writes an audit event. The recipient inventory changes only at `DELIVER`. A stale donor row returns `409 PLAN_STOCK_CHANGED`; the client must re-run the optimizer. The verified signed-in account becomes the audit actor.
+`decision` must be `APPROVE` or `REJECT`. The verified signed-in account (`APPROVER` or `ADMIN`) becomes the audit actor, and only a `PROPOSED` plan can be decided; anything else returns `409 PLAN_ALREADY_DECIDED` before any other work.
+
+With a database, `APPROVE` revalidates the stored plan and never regenerates it:
+
+1. The plan's exact transfers (`fromFacilityId`, `toFacilityId`, `medicineId`, `quantity`, `batchId`, `batchNo`, `departureDay`, `arrivalDay`) are sent to the intelligence service's `POST /scenarios/simulate` with the plan's horizon. `/plans/optimize` is never called.
+2. The response must show, for the same data source, horizon and exact medicine: every transfer evaluated unchanged, eligible and applied; the planned total; `safeToRecommend: true`; no new shortage, critical facility or other new risk; every route present and at most 6 hours; the cold chain kept; the same single batch and quantity for each transfer (first-expiry-first, valid through the horizon); and a passing received-stock check for every donor (`receivedStockCheck`, which ignores future deliveries). A response missing any of this evidence is `503 INVALID_INTELLIGENCE_RESPONSE`.
+3. Only then does one database transaction reserve the stock. It locks the donors' inventory rows and refuses (`409 PLAN_STOCK_CHANGED`, with `details.failures`) unless the donor rows are unchanged since step 1, each transfer's facility, batch ID, batch number and medicine name an `AVAILABLE`, non-quarantined row valid through `SIMULATION_DATE + horizonDays` that holds the quantity, and each donor's usable stock of the medicine, less everything it sends, stays at or above its safety stock. It then marks the plan `RESERVED` (still conditional on `PROPOSED`), writes the transfer items and one audit event, and commits; any failure rolls everything back.
+
+If the plan is no longer safe, the response is `409 PLAN_REVALIDATION_FAILED` and nothing is written. For a donor route raised to 6.5 hours:
+
+```json
+{
+  "error": {
+    "code": "PLAN_REVALIDATION_FAILED",
+    "message": "The plan is no longer safe to reserve (ALL_TRANSFERS_ELIGIBLE, SAFE_TO_RECOMMEND, ROUTES_WITHIN_TRAVEL_LIMIT). No stock was reserved. Re-run the optimizer for current conditions and review the new plan.",
+    "details": {
+      "planId": "plan-...",
+      "failedChecks": [
+        { "name": "ALL_TRANSFERS_ELIGIBLE", "detail": "transfer 0 (WH-TN-001 batch TN-007-B01-26): TRAVEL_TIME_LIMIT_EXCEEDED" },
+        { "name": "SAFE_TO_RECOMMEND", "detail": "The simulator no longer marks the plan safe to recommend." },
+        { "name": "ROUTES_WITHIN_TRAVEL_LIMIT", "detail": "Missing or too long (limit 6 h): transfer 0 (WH-TN-001 batch TN-007-B01-26) 6.5 h." }
+      ],
+      "rejectedTransfers": [{
+        "index": 0, "fromFacilityId": "WH-TN-001", "toFacilityId": "PHC-VLR-001", "batchId": 14, "batchNo": "TN-007-B01-26",
+        "quantity": 250, "rejectionCodes": ["TRAVEL_TIME_LIMIT_EXCEEDED"], "rejectionReasons": ["..."]
+      }],
+      "newShortagesCreated": [], "newCriticalFacilities": [], "newRisks": [],
+      "unsafeDonors": [], "safeToRecommend": false, "modelVersion": "aiml-ripple-simulator-v1", "dataSource": "POSTGRES",
+      "instruction": "No stock was reserved. Re-run the optimizer for current conditions and review the new plan."
+    }
+  }
+}
+```
+
+A deliberate `4xx` from the service during revalidation (for example the medicine no longer exists) is also `409 PLAN_REVALIDATION_FAILED`, with the service error in `details.intelligenceError`. A successful approval returns `revalidation` (checks passed, model version, data source, checked transfers and donor evidence) beside `plan`, `audit` and `persistence`, and the same summary is stored in the audit event's after-state.
+
+`REJECT` needs no intelligence call: it records the decision and audit event and leaves inventory unchanged. In fixture mode an approval reserves nothing, becomes `APPROVED`, and returns `revalidation: { "performed": false, "reason": "FIXTURE_MODE" }`; it is not evidence of production safety. The recipient inventory changes only at `DELIVER`.
 
 ### Lifecycle actions
 
@@ -164,11 +209,13 @@ donor quantity. Every action is transactional and appends an audit event.
 | 403 | `INSUFFICIENT_ROLE` | The signed-in account is not an approver/admin |
 | 409 | `ACCOUNT_EXISTS` | The email address is already registered |
 | 409 | `PLAN_ALREADY_DECIDED`, `PLAN_STOCK_CHANGED`, `PLAN_STATE_CHANGED`, `INVALID_PLAN_TRANSITION` | A plan was already handled, inventory changed, or a lifecycle transition is no longer valid |
+| 409 | `PLAN_REVALIDATION_FAILED` | Approval revalidation found the plan no longer safe; nothing was reserved; re-run the optimizer |
 | 422 | `PLAN_QUANTITY_MISMATCH` | Optimizer transfer items do not sum to the requested quantity |
-| 503 | `INTELLIGENCE_UNAVAILABLE` | MySQL mode cannot reach the safe allocation service; no reserving plan is created |
+| 503 | `INTELLIGENCE_UNAVAILABLE`, `INTELLIGENCE_TIMEOUT`, `INVALID_INTELLIGENCE_RESPONSE` | With a database, the intelligence service could not be reached, did not answer within `INTELLIGENCE_TIMEOUT_MS`, failed with a `5xx`, or returned an unusable response; nothing was simulated, saved or reserved |
 | 404 | `NOT_FOUND`, `FACILITY_NOT_FOUND`, `FORECAST_TARGET_NOT_FOUND`, `OPTIMIZATION_TARGET_NOT_FOUND`, `PLAN_NOT_FOUND` | Resource or target is unavailable |
 | 409 | `PLAN_ALREADY_DECIDED` | A final decision already exists |
-| 422 | `NO_SAFE_PLAN` | No compliant fixture plan could be produced |
+| 422 | `NO_SAFE_PLAN` | No safe plan exists; with the intelligence service, `details` keeps its safe capacity, candidates and escalation |
+| 4xx | Intelligence service codes | Deliberate intelligence decisions (for example `INVALID_QUANTITY_FOR_UNIT`, `MEDICINE_NOT_FOUND`) pass through unchanged |
 | 422 | `TRANSFER_PERSISTENCE_FAILED` | A decision could not be mapped to the seeded transfer records |
 | 503 | `DATABASE_UNAVAILABLE` | MySQL is not reachable or has not been seeded |
 | 500 | `INTERNAL_ERROR` | Unexpected server failure |

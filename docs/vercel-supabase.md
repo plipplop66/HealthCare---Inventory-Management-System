@@ -30,9 +30,12 @@ honestly reported as low-confidence. Safety-policy confirmation remains a
 human responsibility; the seed does not claim Aaryan has approved it.
 
 Forecast outages return an explicitly labelled database fallback. Persistent
-plan optimization fails closed if the intelligence optimizer is unavailable;
-it does not substitute an inventory-reserving fixture plan. A failed AI section
-does not prevent the regional dashboard from loading.
+simulation and plan optimization fail closed (`503`) if the intelligence service
+is unavailable; they never substitute local Node rules or an inventory-reserving
+fixture plan. Approval re-runs the plan's exact transfers through the
+intelligence simulator before the database reserves stock, and fails closed the
+same way (see `docs/api-contract.md`). A failed AI section does not prevent the
+regional dashboard from loading.
 
 ## Configuration
 

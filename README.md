@@ -46,7 +46,7 @@ With Docker Desktop running, start the complete frontend, Express API, FastAPI
 intelligence service, and MySQL stack together:
 
 ```powershell
-pnpm stack:up
+npm run stack:up
 ```
 
 Wait for the health checks, then open `http://127.0.0.1:8080`. The browser
@@ -54,9 +54,12 @@ uses the same-origin `/api` proxy; it never needs a hard-coded localhost API
 address. `http://127.0.0.1:3001/health` should report
 `"dataSource": "MYSQL"`, and the intelligence health endpoint is
 `http://127.0.0.1:8000/health`. The backend sends forecast, ripple-simulation,
-and optimisation requests to that service, with a labelled Node fallback only
-when the service is unavailable. Use `pnpm stack:logs` to inspect services and
-`pnpm stack:down` to stop them. The data is intentionally simulated.
+and optimisation requests to that service, which is the only authority for
+simulation, optimisation and approval safety with a database. If the service is
+unavailable, only the forecast falls back to a labelled estimate; simulation,
+optimisation and approval return `503` and save nothing. Use `npm run stack:logs`
+to inspect services and `npm run stack:down` to stop them. The data is
+intentionally simulated.
 
 For a persistent deployment, copy
 `deploy/production.env.example` to `deploy/production.env`, replace every
@@ -73,10 +76,12 @@ and CORS values rather than accepting development defaults. Point the domain's
 DNS A/AAAA record at the host before starting the stack. An ACME contact email
 is optional, so the committed template does not require personal contact data.
 Its MySQL lifecycle is `PROPOSED → RESERVED → IN_TRANSIT → DELIVERED` (or
-`REJECTED`/`CANCELLED`): approval atomically reserves donor stock and logs the
-decision; delivery alone increases recipient inventory.
+`REJECTED`/`CANCELLED`): approval first re-runs the plan's exact transfers
+through the intelligence service's simulator, then atomically reserves donor
+stock and logs the decision; delivery alone increases recipient inventory. See
+[docs/api-contract.md](docs/api-contract.md) for the approval checks.
 
-For a backend process running outside Docker, use `pnpm db:up`, set `DATA_SOURCE=mysql` in `.env`, and then run `pnpm dev`.
+For a backend process running outside Docker, use `npm run db:up`, set `DATA_SOURCE=mysql` in `.env`, and then run `npm run dev`.
 
 ## Public prototype deployment
 
