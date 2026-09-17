@@ -1,10 +1,12 @@
 const { Pool, types } = require('pg');
 const { AppError } = require('./errors');
 const { postgresTls } = require('./postgres-tls');
+const { UTC_NOW, isoInstant, utcInstant } = require('./postgres-time');
 const { assertReservable, donorCodes, normaliseDonorRows, planMedicineId } = require('./reservation-guard');
 
 const DEFAULT_FIXTURE_MEDICINE_ID = 'med-insulin-100iu-vial';
 const DATE_OID = 1082;
+const TIMESTAMP_OID = 1114;
 // Every inventory row of the plan's donors for its medicine; FOR UPDATE takes the row locks in inventory_id order.
 const DONOR_STOCK_SQL = `
   SELECT i.inventory_id AS "inventoryId", source.facility_code AS "facilityCode", i.batch_id AS "batchId",
@@ -16,9 +18,12 @@ const DONOR_STOCK_SQL = `
   ORDER BY i.inventory_id`;
 // DATE columns stay as their stored YYYY-MM-DD text, as mysql2's dateStrings: ['DATE'] does for the MySQL
 // store. pg would otherwise build a local-midnight Date, which serialises as the previous day east of UTC.
+// TIMESTAMP (without time zone) stays text for the same reason: pg would read it in the Node process's time zone.
+// Timestamps the API returns are selected with utcInstant() instead (see postgres-time.js).
+const TEXT_OIDS = new Set([DATE_OID, TIMESTAMP_OID]);
 const postgresTypes = {
   getTypeParser(oid, format) {
-    return oid === DATE_OID && format !== 'binary' ? (value) => value : types.getTypeParser(oid, format);
+    return TEXT_OIDS.has(oid) && format !== 'binary' ? (value) => value : types.getTypeParser(oid, format);
   }
 };
 let sharedPool = null;
@@ -170,15 +175,15 @@ class PostgresInventoryStore {
 
   async getPersistedPlan(planId) {
     const rows = await this.query(
-      `SELECT plan_id AS id, status, plan_json AS "planJson", created_at AS "createdAt",
-              decided_at AS "decidedAt", decided_by AS "decidedBy"
+      `SELECT plan_id AS id, status, plan_json AS "planJson", ${utcInstant('created_at')} AS "createdAt",
+              ${utcInstant('decided_at')} AS "decidedAt", decided_by AS "decidedBy"
        FROM plans WHERE plan_id = $1 LIMIT 1`, [planId]
     );
     const row = rows[0];
     if (!row) return null;
     return {
-      ...parseJson(row.planJson, {}), id: row.id, status: row.status, createdAt: row.createdAt,
-      ...(row.decidedAt ? { decidedAt: row.decidedAt, decidedBy: row.decidedBy } : {})
+      ...parseJson(row.planJson, {}), id: row.id, status: row.status, createdAt: isoInstant(row.createdAt),
+      ...(row.decidedAt ? { decidedAt: isoInstant(row.decidedAt), decidedBy: row.decidedBy } : {})
     };
   }
 
@@ -256,8 +261,8 @@ class PostgresInventoryStore {
     const transferQuantity = plan.transfers.reduce((total, transfer) => total + Number(transfer.quantity), 0);
     if (Math.abs(requestedQuantity - transferQuantity) > 0.00001) throw new AppError(422, 'PLAN_QUANTITY_MISMATCH', 'The optimiser plan transfer quantities do not equal the requested quantity.');
     await this.query(
-      `INSERT INTO plans (plan_id, destination_facility_id, medicine_id, requested_quantity, horizon_days, status, rationale, plan_json)
-       VALUES ($1, $2, $3, $4, $5, 'PROPOSED', $6, $7::JSONB) ON CONFLICT (plan_id) DO NOTHING`,
+      `INSERT INTO plans (plan_id, destination_facility_id, medicine_id, requested_quantity, horizon_days, status, rationale, plan_json, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'PROPOSED', $6, $7::JSONB, ${UTC_NOW}) ON CONFLICT (plan_id) DO NOTHING`,
       [plan.id, destination.id, medicine.id, requestedQuantity, plan.horizonDays,
         plan.rationale || 'A human review is required before any stock movement.', JSON.stringify(plan)]
     );
@@ -303,7 +308,7 @@ class PostgresInventoryStore {
     for (const transfer of plan.transfers) {
       // The same row conditions again, so a reservation can never succeed on a row the checks did not see.
       const stockResult = await client.query(
-        `UPDATE inventory i SET quantity_on_hand = i.quantity_on_hand - $1, last_updated = CURRENT_TIMESTAMP
+        `UPDATE inventory i SET quantity_on_hand = i.quantity_on_hand - $1, last_updated = ${UTC_NOW}
          FROM facilities source, batches b
          WHERE source.facility_id = i.facility_id AND source.facility_code = $2 AND i.batch_id = $3 AND b.batch_id = i.batch_id
            AND b.batch_number = $4 AND b.medicine_id::TEXT = $5 AND i.status = 'AVAILABLE' AND b.quarantined = FALSE
@@ -326,7 +331,7 @@ class PostgresInventoryStore {
       await client.query('BEGIN');
       const planStatus = decision === 'APPROVE' ? 'RESERVED' : 'REJECTED';
       const planResult = await client.query(
-        `UPDATE plans SET status = $1::plan_status_enum, decided_at = CURRENT_TIMESTAMP, decided_by = $2
+        `UPDATE plans SET status = $1::plan_status_enum, decided_at = ${UTC_NOW}, decided_by = $2
          WHERE plan_id = $3 AND status = 'PROPOSED' RETURNING plan_id`, [planStatus, actor, plan.id]
       );
       if (planResult.rowCount !== 1) throw new AppError(409, 'PLAN_ALREADY_DECIDED', 'Only a proposed plan can be approved or rejected.');
@@ -335,9 +340,9 @@ class PostgresInventoryStore {
       for (const transfer of plan.transfers) {
         const transferResult = await client.query(
           `INSERT INTO transfers (plan_id, origin_facility_id, destination_facility_id, medicine_id, batch_id, quantity,
-                                  status, rejection_reason, approved_at, approved_by, note)
-           SELECT $1, source.facility_id, destination.facility_id, $2, $3, $4, $5::transfer_status_enum, $6,
-                  CASE WHEN $5 = 'RESERVED' THEN CURRENT_TIMESTAMP ELSE NULL END,
+                                  status, rejection_reason, requested_at, approved_at, approved_by, note)
+           SELECT $1, source.facility_id, destination.facility_id, $2, $3, $4, $5::transfer_status_enum, $6, ${UTC_NOW},
+                  CASE WHEN $5 = 'RESERVED' THEN ${UTC_NOW} ELSE NULL END,
                   CASE WHEN $5 = 'RESERVED' THEN $7 ELSE NULL END, $8
            FROM facilities source CROSS JOIN facilities destination
            WHERE source.facility_code = $9 AND destination.facility_code = $10 RETURNING transfer_id`,
@@ -348,8 +353,8 @@ class PostgresInventoryStore {
         transferIds.push(transferResult.rows[0].transfer_id);
       }
       const auditResult = await client.query(
-        `INSERT INTO audit_events (entity_type, entity_id, action, actor, note, before_state_json, after_state_json)
-         VALUES ('plan', $1, $2, $3, $4, $5::JSONB, $6::JSONB) RETURNING audit_id`,
+        `INSERT INTO audit_events (entity_type, entity_id, action, actor, note, before_state_json, after_state_json, event_timestamp)
+         VALUES ('plan', $1, $2, $3, $4, $5::JSONB, $6::JSONB, ${UTC_NOW}) RETURNING audit_id`,
         [plan.id, decision === 'APPROVE' ? 'RESERVE' : 'REJECT', actor, note, JSON.stringify(beforeState), JSON.stringify(afterState)]
       );
       await client.query('COMMIT');
@@ -373,7 +378,7 @@ class PostgresInventoryStore {
       client = await this.pool.connect();
       await client.query('BEGIN');
       const planResult = await client.query(
-        `UPDATE plans SET status = $1::plan_status_enum, decided_at = CURRENT_TIMESTAMP, decided_by = $2
+        `UPDATE plans SET status = $1::plan_status_enum, decided_at = ${UTC_NOW}, decided_by = $2
          WHERE plan_id = $3 AND status = $4::plan_status_enum RETURNING plan_id`,
         [transition.to, actor, plan.id, transition.from]
       );
@@ -388,8 +393,8 @@ class PostgresInventoryStore {
       if (action === 'DELIVER') {
         for (const transfer of transfers) {
           await client.query(
-            `INSERT INTO inventory (facility_id, batch_id, quantity_on_hand, status) VALUES ($1, $2, $3, 'AVAILABLE')
-             ON CONFLICT (facility_id, batch_id, status) DO UPDATE SET quantity_on_hand = inventory.quantity_on_hand + EXCLUDED.quantity_on_hand, last_updated = CURRENT_TIMESTAMP`,
+            `INSERT INTO inventory (facility_id, batch_id, quantity_on_hand, status, last_updated) VALUES ($1, $2, $3, 'AVAILABLE', ${UTC_NOW})
+             ON CONFLICT (facility_id, batch_id, status) DO UPDATE SET quantity_on_hand = inventory.quantity_on_hand + EXCLUDED.quantity_on_hand, last_updated = ${UTC_NOW}`,
             [transfer.destinationFacilityId, transfer.batchId, transfer.quantity]
           );
         }
@@ -397,7 +402,7 @@ class PostgresInventoryStore {
       if (action === 'CANCEL') {
         for (const transfer of transfers) {
           const restoreResult = await client.query(
-            `UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_updated = CURRENT_TIMESTAMP
+            `UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_updated = ${UTC_NOW}
              WHERE facility_id = $2 AND batch_id = $3 AND status = 'AVAILABLE' RETURNING inventory_id`,
             [transfer.quantity, transfer.originFacilityId, transfer.batchId]
           );
@@ -406,12 +411,12 @@ class PostgresInventoryStore {
       }
       const timestampColumn = action === 'DISPATCH' ? 'dispatched_at' : action === 'DELIVER' ? 'delivered_at' : 'cancelled_at';
       await client.query(
-        `UPDATE transfers SET status = $1::transfer_status_enum, ${timestampColumn} = CURRENT_TIMESTAMP
+        `UPDATE transfers SET status = $1::transfer_status_enum, ${timestampColumn} = ${UTC_NOW}
          WHERE plan_id = $2 AND status = $3::transfer_status_enum`, [transition.transferTo, plan.id, transition.transferFrom]
       );
       const auditResult = await client.query(
-        `INSERT INTO audit_events (entity_type, entity_id, action, actor, note, before_state_json, after_state_json)
-         VALUES ('plan', $1, $2, $3, $4, $5::JSONB, $6::JSONB) RETURNING audit_id`,
+        `INSERT INTO audit_events (entity_type, entity_id, action, actor, note, before_state_json, after_state_json, event_timestamp)
+         VALUES ('plan', $1, $2, $3, $4, $5::JSONB, $6::JSONB, ${UTC_NOW}) RETURNING audit_id`,
         [plan.id, transition.action, actor, note, JSON.stringify(beforeState), JSON.stringify({ status: transition.to, action })]
       );
       await client.query('COMMIT');
@@ -424,11 +429,12 @@ class PostgresInventoryStore {
   }
 
   async listAuditEvents() {
-    return this.query(
+    const rows = await this.query(
       `SELECT audit_id AS id, entity_type AS "entityType", entity_id AS "entityId", action, actor, note,
-              before_state_json AS "beforeState", after_state_json AS "afterState", event_timestamp AS timestamp
+              before_state_json AS "beforeState", after_state_json AS "afterState", ${utcInstant('event_timestamp')} AS timestamp
        FROM audit_events ORDER BY event_timestamp DESC, audit_id DESC LIMIT 100`
     );
+    return rows.map((row) => ({ ...row, timestamp: isoInstant(row.timestamp) }));
   }
 
   async getInventory(facilityId, medicineId = DEFAULT_FIXTURE_MEDICINE_ID) {

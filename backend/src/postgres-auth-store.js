@@ -1,6 +1,8 @@
 const { Pool } = require('pg');
 const { AppError } = require('./errors');
 const { postgresTls } = require('./postgres-tls');
+const { postgresTypes } = require('./postgres-store');
+const { UTC_NOW, isoInstant, utcInstant } = require('./postgres-time');
 
 function mapUser(row) {
   if (!row) return null;
@@ -11,7 +13,7 @@ function mapUser(row) {
     passwordHash: row.password_hash,
     role: row.role,
     active: row.is_active,
-    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at
+    createdAt: isoInstant(row.created_at)
   };
 }
 
@@ -27,6 +29,7 @@ function getPool(config) {
     pool = new Pool({
       connectionString: databaseUrl,
       ssl: postgresTls(config),
+      types: postgresTypes,
       max: 2,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000,
@@ -55,7 +58,7 @@ function createPostgresAuthStore(config, dependencies = {}) {
     source: 'POSTGRES',
     async findByEmail(email) {
       const rows = await query(
-        `SELECT user_id, full_name, email, password_hash, role, is_active, created_at
+        `SELECT user_id, full_name, email, password_hash, role, is_active, ${utcInstant('created_at')} AS created_at
          FROM app_users WHERE email = $1 LIMIT 1`,
         [email]
       );
@@ -64,8 +67,8 @@ function createPostgresAuthStore(config, dependencies = {}) {
     async create(user) {
       try {
         await db.query(
-          `INSERT INTO app_users (user_id, full_name, email, password_hash, role, is_active)
-           VALUES ($1, $2, $3, $4, $5, TRUE)`,
+          `INSERT INTO app_users (user_id, full_name, email, password_hash, role, is_active, created_at)
+           VALUES ($1, $2, $3, $4, $5, TRUE, ${UTC_NOW})`,
           [user.id, user.name, user.email, user.passwordHash, user.role]
         );
       } catch (error) {
@@ -77,7 +80,7 @@ function createPostgresAuthStore(config, dependencies = {}) {
       return user;
     },
     async recordLogin(userId) {
-      await query('UPDATE app_users SET last_login_at = CURRENT_TIMESTAMP WHERE user_id = $1', [userId]);
+      await query(`UPDATE app_users SET last_login_at = ${UTC_NOW} WHERE user_id = $1`, [userId]);
     },
     async close() {
       if (pool) {

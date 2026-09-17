@@ -24,6 +24,8 @@ Every failure is shaped as:
 }
 ```
 
+Timestamps (`createdAt`, `decidedAt`, audit `timestamp`) are ISO-8601 UTC instants such as `2026-09-17T16:16:25.935Z`; clients convert them to local time for display. PostgreSQL stores them in `TIMESTAMP` columns as UTC wall-clock time, and the API writes and reads them as UTC regardless of the server's or the database session's time zone. The local MySQL store still reads them in the Node process's time zone: the Compose containers run in UTC, and a backend started directly on a host for MySQL needs `TZ=UTC`.
+
 `source` is important: `INTELLIGENCE_SERVICE` means Druv's live service answered; `FIXTURE_STORE` means deterministic simulated fixture data; `FIXTURE_FALLBACK` means the fixture used the local Node rules because the service was unavailable (development only); `DATABASE_FALLBACK` means a forecast was estimated from the active database records while the service was unavailable. Fallback results carry `isFallback: true`, a `fallbackReason` and `meta.fallback: true`. They are usable for integration only, not a release result, and are never used for approval.
 
 With a database (`DATA_SOURCE=mysql`, or PostgreSQL through `DATABASE_URL`), inventory, optimization, approval, lifecycle and audit routes use that database, and the intelligence service is the only authority for simulation, optimization and approval safety:
