@@ -7,7 +7,9 @@ import { Button, EmptyOrError } from './components/ui';
 import { medrippleApi, usingMockData } from './services/medrippleApi';
 import { completeSelection } from './services/selection';
 import { createWorkspace } from './services/workspace';
+import { mapCandidates } from './services/evidence';
 import { Dashboard } from './pages/Dashboard';
+import { Candidates } from './pages/Candidates';
 import { FacilityDetail } from './pages/FacilityDetail';
 import { RippleSimulator } from './pages/RippleSimulator';
 import { PlanReview } from './pages/PlanReview';
@@ -104,13 +106,14 @@ function App() {
   }, [user]);
 
   const pageKey = view === 'facility' && selection.facilityId && selection.medicineId ? `facility:${selection.facilityId}:${selection.medicineId}:${selection.horizonDays}:${version}`
-    : view === 'plan' ? `plan:${version}` : view === 'audit' ? `audit:${version}` : '';
+    : view === 'plan' ? `plan:${version}` : view === 'candidates' ? `candidates:${version}` : view === 'audit' ? `audit:${version}` : '';
   useEffect(() => {
     if (!user || !pageKey) return undefined;
     let active = true;
     setPage({ key: pageKey, data: null, error: null });
     const load = view === 'facility' ? () => workspace.loadFacility(selection)
       : view === 'plan' ? () => workspace.loadAssessment().then((result) => ({ assessment: result }))
+        : view === 'candidates' ? () => workspace.loadAssessment().then((result) => ({ candidates: mapCandidates(result) }))
         : () => workspace.loadAudit();
     load().then((data) => { if (active) setPage({ key: pageKey, data, error: null }); })
       .catch((error) => { if (!active) return; if (error.status === 401) setUser(null); else setPage({ key: pageKey, data: null, error }); });
@@ -166,12 +169,12 @@ function App() {
 
   const content = (() => {
     if (view === 'dashboard') return <Dashboard data={dashboard} onOpenFacility={openFacility} />;
-    if (view === 'candidates') return <EmptyOrError title="No donor assessment yet" copy="Donor candidates come from the optimizer's assessment. Run the ripple simulator to see eligible and rejected donors." actionLabel="open ripple simulator" retry={() => setView('simulator')} />;
     if (view === 'simulator') return <RippleSimulator catalog={catalog} selection={selection} onSelection={updateSelection} onRun={runAssessment} busy={busy} assessment={assessment} error={assessError} onReview={() => setView('plan')} />;
     const selectionBar = view === 'facility' && <SelectionBar catalog={catalog} selection={selection} onChange={updateSelection} showQuantity={false} />;
     if (page.key !== pageKey || (!page.data && !page.error)) return <>{selectionBar}<p role="status">Loading {view} from the API…</p></>;
     if (page.error) return <>{selectionBar}<EmptyOrError title="This section is unavailable" copy={page.error.message} retry={() => setVersion((current) => current + 1)} /></>;
     if (view === 'facility') return <>{selectionBar}<FacilityDetail data={page.data} onAssess={() => setView('simulator')} /></>;
+    if (view === 'candidates') return <Candidates data={page.data.candidates} onOpenSimulator={() => setView('simulator')} />;
     if (view === 'plan') {
       const selected = page.data.assessment;
       if (!selected) return <EmptyOrError title="Select a plan to review" copy="Run a safety assessment in the ripple simulator first. Opening this page never creates a plan." actionLabel="open ripple simulator" retry={() => setView('simulator')} />;

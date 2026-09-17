@@ -217,3 +217,20 @@ tbody tr:hover td { background: rgb(255 255 255 / .025); }
 .selection-bar { flex-direction: column; align-items: stretch; }
 .horizon-field { display: grid; gap: 4px; color: var(--mr-muted); font-size: 11px; }
 .field-error { margin: 8px 0 0; color: var(--mr-danger); font-size: 12px; }
+.reason-list { display: grid; gap: 4px; margin: 6px 0 0; padding: 0; list-style: none; }
+.reason-list li { color: var(--mr-muted); font-size: 10.5px; line-height: 1.35; }
+code { padding: 1px 5px; border-radius: 4px; color: #bae6fd; background: rgb(56 189 248 / .12); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; }
+.check-list { margin-top: 14px; }
+.check-list h3 { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+.check-list ul { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.check-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; padding: 6px 8px; border: 1px solid var(--mr-border); border-radius: 8px; font-size: 11px; }
+.check-list li span { flex-basis: 100%; color: var(--mr-muted); }
+.check-list li b { font-size: 10px; }
+.check-list li.passed b { color: var(--mr-good); }
+.check-list li.failed { border-color: rgb(252 165 165 / .4); }
+.check-list li.failed b { color: var(--mr-danger); }
+.subhead { margin: 14px 0 6px; font-size: 12px; }
+.plan-result .card-heading { flex-wrap: wrap; }
+.plan-result-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.limitation { margin: 12px 0 0; font-size: 11px; }
+.plan-grid + .evidence-card { margin-top: 16px; }
