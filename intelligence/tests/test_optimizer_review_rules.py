@@ -2,19 +2,23 @@
 
 Covers the six-hour donor route cap (in the optimizer and the Ripple Simulator), donor capacity from received stock
 only, FEFO tie-breaking by batch ID, the approved guardrail values and mapping statuses, exact medicine identity, cold
-chain, NO_SAFE_PLAN, determinism and response wording. In-memory rows and the fixture; no MySQL.
+chain, NO_SAFE_PLAN, determinism and response wording, also through the PostgreSQL data source. In-memory rows and the
+fixture; no database server.
 """
 
 import json
 import math
+from dataclasses import replace
 from datetime import date
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import POSTGRES
 from app.data_store import Batch, SimulatedDataStore
 from app.main import create_app
 from app.optimizer import DEFAULT_OPTIMIZER_CONFIG, OptimizerConfig
+from app.postgres_store import PostgreSQLDataSource
 from app.simulator import PATIENT_IMPACT_LIMITATION, PROTOTYPE_VALIDATION_LIMITATION
 from tests.optimizer_support import (
     arrived_replenishment_tables,
@@ -28,8 +32,21 @@ from tests.optimizer_support import (
     replace_facility_rows,
     replenishment_status_tables,
     routes_with,
+    with_batch_ids,
 )
-from tests.simulator_support import HOSPITAL, INSULIN, INVENTORY_ROWS, PHC, WAREHOUSE, facility, inventory_row, simulate, transfer
+from tests.simulator_support import (
+    HOSPITAL,
+    INSULIN,
+    INVENTORY_ROWS,
+    PHC,
+    SETTINGS,
+    WAREHOUSE,
+    FakeDatabase,
+    facility,
+    inventory_row,
+    simulate,
+    transfer,
+)
 
 FIXTURE_INSULIN = "med-insulin-100iu-vial"
 APPROVED = "APPROVED_FOR_HACKATHON_PROTOTYPE"
@@ -333,3 +350,38 @@ def test_fefo_key_falls_back_to_batch_number_only_without_database_ids():
     assert [batch.batch_no for batch in sorted(database, key=lambda batch: batch.fefo_key)] == ["Z", "B", "A"]
     fixture = [Batch("INS-2", 1, same_expiry, "USABLE"), Batch("INS-1", 1, same_expiry, "USABLE")]
     assert [batch.batch_no for batch in sorted(fixture, key=lambda batch: batch.fefo_key)] == ["INS-1", "INS-2"]
+
+
+# ---- PostgreSQL mode applies the same reviewed rules ----
+
+
+def postgres_client():
+    """The optimizer's in-memory rows served through the PostgreSQL data source, which shares the MySQL queries."""
+    settings = replace(SETTINGS, data_source=POSTGRES, database_url="postgresql://unused/test")
+    database = FakeDatabase(inventory=with_batch_ids(INVENTORY_ROWS))
+    return TestClient(create_app(data_source=PostgreSQLDataSource(settings, database.connect)))
+
+
+def test_postgres_plans_use_the_reviewed_rules_and_approved_mappings():
+    body = ok(optimize(postgres_client(), "PHC-SIM-001", 600))
+    assert (body["dataContext"]["dataSource"], body["modelVersion"], body["requiresHumanApproval"]) == ("POSTGRES", "aiml-transfer-optimizer-v2", True)
+    assert [(item["fromFacilityId"], item["batchId"], item["quantity"]) for item in body["transfers"]] == [("WH-SIM-001", 14, 600.0)]
+    guardrail = body["equityGuardrail"]
+    assert (guardrail["maxTravelHours"], guardrail["donorCapacityBasis"], guardrail["status"]) == (6.0, "RECEIVED_STOCK_ONLY", APPROVED)
+    assert candidate(body, "SC-SIM-001")["rejectionCodes"] == ["TRAVEL_TIME_LIMIT_EXCEEDED"]
+    assert candidate(body, "DH-SIM-001")["futureReplenishmentExcluded"] == 700.0
+    mappings = {item["name"]: item for item in body["dataContext"]["mappings"]}
+    approved = ("effectiveStock", "coldChain", "equityReserve", "travelTimeLimit", "donorReceivedStockOnly", "quantityScale", "batchIdentity")
+    assert all(mappings[name]["status"] == APPROVED for name in approved)
+    assert "then by batches.batch_id" in mappings["batchIdentity"]["rule"]
+    assert checks(body)["ROUTES_WITHIN_TRAVEL_LIMIT"] and checks(body)["DONORS_SAFE_WITHOUT_FUTURE_SUPPLY"]
+
+
+def test_postgres_simulator_and_optimizer_agree_on_a_route_over_six_hours():
+    client = postgres_client()
+    simulation = simulate(client, transfer("SC-SIM-001", "PHC-SIM-001", 1)).json()
+    item = simulation["transferEvaluations"][0]
+    assert (simulation["scenarioType"], simulation["dataContext"]["dataSource"]) == ("SIMULATED_DATABASE", "POSTGRES")
+    assert (item["eligible"], item["applied"], item["rejectionCodes"]) == (False, True, ["TRAVEL_TIME_LIMIT_EXCEEDED"])
+    assert simulation["comparison"]["safeToRecommend"] is False
+    assert item["rejectionReasons"] == candidate(ok(optimize(client, "PHC-SIM-001", 600)), "SC-SIM-001")["rejectionReasons"]

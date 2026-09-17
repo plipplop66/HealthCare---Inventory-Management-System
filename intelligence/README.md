@@ -9,7 +9,7 @@ A standalone Python FastAPI service that forecasts medicine demand, projects sto
 - **Ripple Simulator:** `POST /scenarios/simulate` projects every facility before and after proposed transfers, with the same forecast and projection, and says whether they are safe to recommend. See [Ripple Simulator](#ripple-simulator-post-scenariossimulate).
 - **Transfer optimizer:** `POST /plans/optimize` proposes the smallest safe multi-source plan for a requested quantity, using OR-Tools CP-SAT. The Ripple Simulator validates every plan before it is returned. See [Transfer optimizer](#transfer-optimizer-post-plansoptimize).
 
-The HTTP service reads either the offline Navjeevan PHC fixture or Dhiren's MySQL database (see [Data sources](#data-sources)). Both use the same calculation code, so they always return the same numbers for the same data. Day 1 is intentionally transparent: a weighted moving average and simple rules, with no deep learning, LLMs or randomness.
+The HTTP service reads the offline Navjeevan PHC fixture, Dhiren's MySQL database, or the same dataset in PostgreSQL (see [Data sources](#data-sources)). All three use the same calculation code, so they always return the same numbers for the same data. Day 1 is intentionally transparent: a weighted moving average and simple rules, with no deep learning, LLMs or randomness.
 
 ## Quick start
 
@@ -41,25 +41,27 @@ If `pip install` fails with `CERTIFICATE_VERIFY_FAILED`, the venv's pip is proba
 
 ## Data sources
 
-`DATA_SOURCE` selects where facilities, medicines, stock and consumption come from. Both modes run exactly the same forecast, projection and risk code: `app/mysql_store.py` only reads database rows and normalises them into the structures the fixture uses.
+`DATA_SOURCE` selects where facilities, medicines, stock and consumption come from. All modes run exactly the same forecast, projection and risk code: `app/mysql_store.py` only reads database rows and normalises them into the structures the fixture uses, and `app/postgres_store.py` reuses it with a PostgreSQL connection.
 
 | `DATA_SOURCE` | Reads | IDs | Quantities |
 | --- | --- | --- | --- |
 | `fixture` (default) | Offline Navjeevan PHC fixture (`app/data_store.py`, `data/simulated_consumption.csv`) | `facility-navjeevan-phc` and three others; `med-insulin-100iu-vial` | `vial` |
 | `mysql` | Only Dhiren's MySQL database (`database/schema.sql` and `golden-scenario.sql`), read-only | `facilities.facility_code` (e.g. `PHC-VLR-001`) or the numeric `facility_id`; the numeric `medicine_id` (e.g. `7`) or the documented alias `med-insulin-100iu-vial` | The medicine's base unit (`mg`, `mL` or `count`), decimals kept |
+| `postgres` | The same dataset in PostgreSQL (Supabase for the Vercel deployment) through `DATABASE_URL`, read-only, with the same queries and interpretation rules as `mysql` | As `mysql` | As `mysql` |
 
-In `mysql` mode the service never uses fixture data: fixture IDs return 404, and if MySQL cannot be reached `POST /forecast` returns 503 `DATABASE_UNAVAILABLE`.
+In `mysql` and `postgres` mode the service never uses fixture data: fixture IDs return 404, and if the database cannot be reached `POST /forecast` returns 503 `DATABASE_UNAVAILABLE`. PostgreSQL connections verify the server certificate (`sslmode=verify-full`, with `certs/supabase-ca.crt` for Supabase hosts) and run in a read-only transaction. `dataContext.dataSource` is `POSTGRES`, and the reviewed transfer rules and mapping statuses are identical to `mysql`.
 
 Environment variables use the names in `backend/src/config.js`. This service does not read `.env`, so set them in the shell.
 
 | Variable | Default | Mode |
 | --- | --- | --- |
-| `DATA_SOURCE` | `fixture` | both |
+| `DATA_SOURCE` | `fixture` | all |
 | `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_NAME`, `DATABASE_USER`, `DATABASE_PASSWORD` | `127.0.0.1`, `3306`, `medripple`, `medripple`, empty | `mysql` |
-| `SIMULATION_DATE` | `2026-09-11` | `mysql` |
-| `DATABASE_CONNECT_TIMEOUT_SECONDS` | `5` | `mysql` |
+| `DATABASE_URL` | none (required) | `postgres` |
+| `SIMULATION_DATE` | `2026-09-11` | `mysql`, `postgres` |
+| `DATABASE_CONNECT_TIMEOUT_SECONDS` | `5` | `mysql`, `postgres` |
 
-`DATABASE_URL` is rejected at startup in `mysql` mode, so the service cannot silently connect to a different database than configured.
+`DATABASE_URL` is rejected at startup in `mysql` mode, so the service cannot silently connect to a different database than configured, and `postgres` mode refuses to start without it.
 
 Run against the database started by `pnpm db:up` (PowerShell):
 
@@ -70,7 +72,7 @@ $env:DATA_SOURCE = "mysql"; $env:DATABASE_PASSWORD = "medripple_dev_only"
 
 ### How database fields are interpreted
 
-Every MySQL forecast returns these rules in `dataContext.mappings` and `assumptions`. `units` is database policy, and `effectiveStock` is approved by Dhiren for the hackathon prototype (`APPROVED_FOR_HACKATHON_PROTOTYPE`). The others are **provisional** until the named owner confirms them.
+Every MySQL or PostgreSQL forecast returns these rules in `dataContext.mappings` and `assumptions`. `units` is database policy, and `effectiveStock` is approved by Dhiren for the hackathon prototype (`APPROVED_FOR_HACKATHON_PROTOTYPE`). The others are **provisional** until the named owner confirms them.
 
 | Mapping | Rule | Review |
 | --- | --- | --- |
@@ -176,7 +178,7 @@ Invalid input raises `ValueError` naming the field. Fewer than 14 valid daily re
 3. From the repository root, run `pnpm dev`.
 4. `POST http://127.0.0.1:3001/api/forecast` now returns `meta.source: "INTELLIGENCE_SERVICE"` and `meta.fallback: false`, for example with `{"facilityId": "PHC-VLR-001", "medicineId": "7", "horizonDays": 14}` in MySQL mode.
 
-If this service is stopped, slower than `INTELLIGENCE_TIMEOUT_MS` (default 2500 ms), or returns any non-2xx status, the Node adapter falls back to its own labelled forecast (`FIXTURE_FALLBACK`, or `DATABASE_FALLBACK` in MySQL mode). That includes this service's deliberate errors, such as `NO_CONSUMPTION_HISTORY` for a warehouse; see [Backend changes requested](#backend-changes-requested).
+If this service is stopped, slower than `INTELLIGENCE_TIMEOUT_MS` (default 2500 ms), or returns a 5xx status, the Node adapter falls back to its own labelled forecast (`FIXTURE_FALLBACK`, or `DATABASE_FALLBACK` with a database). This service's deliberate 4xx answers, such as `NO_CONSUMPTION_HISTORY` for a warehouse, are passed through to the caller instead; see [Node backend integration](#node-backend-integration).
 
 This directory is deliberately **not** a pnpm workspace member. pnpm members must be Node packages, and adding one changes `pnpm-lock.yaml`, which CI installs with `--frozen-lockfile`. The Python commands above are kept separate.
 
@@ -248,7 +250,7 @@ The simulator shows what happens to **every facility holding the medicine** if o
 - Does regional shortage get better or worse?
 - Is the scenario safe to recommend, and why is each transfer accepted or rejected?
 
-It is not connected to the Node `/api/scenarios/simulate` route yet; see [Backend changes requested](#backend-changes-requested).
+Node's `/api/scenarios/simulate` route calls it when `INTELLIGENCE_SERVICE_URL` is set, and uses its own labelled simulator only when this service is unavailable; see [Node backend integration](#node-backend-integration).
 
 ### Request
 
@@ -353,7 +355,7 @@ The simulator only reads. The MySQL session is opened with `SET SESSION TRANSACT
 >
 > The objective order, equity guardrail, donor exclusions, six-hour route cap and received-stock-only donor rule were accepted in the biomedical (Aaryan) and database (Dhiren) reviews **for this hackathon prototype only**. They are not clinically validated; real deployment requires clinical, regulatory and operational validation.
 
-Given a destination, one exact medicine, a quantity and a horizon, the optimizer proposes the smallest safe redistribution plan, from one or more donors. It uses Google OR-Tools CP-SAT for the allocation and the Ripple Simulator as the final safety check: a plan is returned only after the simulator evaluates the complete plan and marks it safe. It is not connected to the Node `/api/plans/optimize` route yet; see [Backend changes requested](#backend-changes-requested).
+Given a destination, one exact medicine, a quantity and a horizon, the optimizer proposes the smallest safe redistribution plan, from one or more donors. It uses Google OR-Tools CP-SAT for the allocation and the Ripple Simulator as the final safety check: a plan is returned only after the simulator evaluates the complete plan and marks it safe. Node's `/api/plans/optimize` route calls it and keeps the returned plan `id`. With a database, Node creates no plan while this service is unavailable; only the fixture store falls back to the labelled Node optimizer. See [Node backend integration](#node-backend-integration).
 
 ### Request
 
@@ -816,7 +818,6 @@ tests/                   pytest suite: fixture API and engine, MySQL store, simu
 
 ## Not implemented yet
 
-- **Node integration and frontend.** The Node backend does not call `POST /scenarios/simulate` or `POST /plans/optimize` yet (see [Backend changes requested](#backend-changes-requested)), and there is no frontend work here.
 - **Prototype-only rules.** The optimizer's guardrails are approved for the hackathon prototype only, not clinically validated. Emergency and outbreak exceptions and travel-time-derived remoteness are deferred; see [Deferred decisions](#deferred-decisions).
 - **Not modelled:**
   - batch expiry during the horizon (no simulated batch expires within 30 days of the snapshot), and donors dispensing from the batches chosen for transfer;
