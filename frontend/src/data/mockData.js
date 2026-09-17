@@ -1,87 +1,137 @@
-export const dashboard = {
-  snapshotAt: '08:15 IST',
-  dateLabel: '13 Sep 2026',
-  metrics: [
-    { label: 'Resilience score', value: '87.4%', detail: '8.2 pts across the demo period', tone: 'healthy', icon: 'pulse' },
-    { label: 'Earliest stockout', value: '2.3', unit: 'days', detail: 'Chennai Central needs action', tone: 'critical', icon: 'clock' },
-    { label: 'Critical count', value: '03', unit: '/ 8', detail: 'Facility stock coverage below 4 days', tone: 'critical', icon: 'alert' },
-    { label: 'Patient-days at risk', value: '1,248', detail: 'Illustrative 7-day exposure', tone: 'watch', icon: 'people' },
-  ],
-  facilities: [
-    { id: 'porur', name: 'Porur Community', x: 20, y: 62, risk: 'healthy', days: 14.2, medicine: 'Insulin 100 IU/mL' },
-    { id: 'anna-nagar', name: 'Anna Nagar Medical', x: 34, y: 39, risk: 'watch', days: 6.4, medicine: 'Ceftriaxone 1 g' },
-    { id: 'northside', name: 'Northside Medical', x: 55, y: 18, risk: 'critical', days: 2.8, medicine: 'Insulin 100 IU/mL' },
-    { id: 'velachery', name: 'Velachery Hospital', x: 39, y: 82, risk: 'healthy', days: 12.9, medicine: 'Salbutamol 100 mcg' },
-    { id: 'adyar', name: 'Adyar Health Centre', x: 67, y: 82, risk: 'critical', days: 3.1, medicine: 'Salbutamol 100 mcg' },
-    { id: 'east-coast', name: 'East Coast Medical', x: 83, y: 61, risk: 'healthy', days: 9.7, medicine: 'Insulin 100 IU/mL' },
-    { id: 'central', name: 'Chennai Central', x: 53, y: 57, risk: 'critical', days: 2.3, medicine: 'Ceftriaxone 1 g' },
-    { id: 'tambaram', name: 'Tambaram PHC', x: 62, y: 44, risk: 'watch', days: 5.6, medicine: 'Ceftriaxone 1 g' },
-  ],
-  alerts: [
-    { facility: 'Chennai Central', medicine: 'Ceftriaxone 1 g', summary: '2.3 days of stock remaining', status: 'Stockout risk within 4 days', tone: 'critical' },
-    { facility: 'Northside Medical', medicine: 'Human Insulin 100 IU/mL', summary: '2.8 days of stock remaining', status: 'Stockout risk within 4 days', tone: 'critical' },
-    { facility: 'Adyar Health Centre', medicine: 'Salbutamol 100 mcg', summary: '3.1 days of stock remaining', status: 'Stockout risk within 4 days', tone: 'critical' },
-    { facility: 'Chennai Central', medicine: 'Demand spike +32%', summary: 'Ceftriaxone 1 g', status: 'Forecast divergence warning', tone: 'watch' },
-  ],
+// MOCK DATA for demonstrating the interface without a backend (VITE_USE_MOCKS=true). Every object follows the
+// Node API contract (docs/api-contract.md) and every response is labelled MOCK_DATA. Nothing here is real, and
+// the mock transport returns these canned results instead of calculating anything.
+
+export const MOCK_SOURCE = 'MOCK_DATA';
+
+export const mockUsers = {
+  'mock.approver@medripple.demo': { id: 'mock-approver', name: 'Mock Approver', email: 'mock.approver@medripple.demo', role: 'APPROVER' },
 };
 
-export const facility = {
-  id: 'central',
-  name: 'Chennai Central',
-  type: 'District hub',
-  region: 'Chennai region',
-  medicine: 'Ceftriaxone 1 g injection',
-  presentation: '1 g vial',
-  risk: 'critical',
-  riskScore: 92,
-  effectiveStock: 46,
-  unit: 'vials',
-  dailyDemand: 20,
-  daysRemaining: 2.3,
-  incomingSupply: { amount: 120, eta: 'in 6 days', status: 'Delayed 2 days' },
-  cause: 'Demand shock',
-  confidence: 'High confidence · 86%',
-  freshness: 'Inventory synced 12 minutes ago',
-  series: [89, 76, 65, 53, 46, 30, 10, 0, 0, 0, 0, 58, 38, 17],
-  nextSteps: ['Review safe multi-source candidates', 'Verify the delayed replenishment', 'Send a plan for pharmacist approval'],
-};
-
-export const candidates = {
-  target: 'Chennai Central',
-  medicine: 'Insulin 100 IU/mL',
-  request: 35,
-  rows: [
-    { id: 'north', facility: 'North PHC', distance: '14.2 km', type: 'Rural PHC', stock: 105, surplus: 70, chain: 'Compliant Tier-2', expiry: 'Nov 2026', eligible: false, reason: 'Would deplete donor to a critical level on day 9.' },
-    { id: 'east', facility: 'East Clinic', distance: '6.5 km', type: 'Sub-hub', stock: 60, surplus: 25, chain: 'Compliant Tier-2', expiry: 'Oct 2026', eligible: true, reason: 'Retains protected coverage after a 20-vial transfer.' },
-    { id: 'west', facility: 'West Station', distance: '22.8 km', type: 'Outpost', stock: 42, surplus: 15, chain: 'Transit log pending', expiry: 'Jan 2027', eligible: true, reason: 'Feasible with a cold-chain log confirmation.' },
-    { id: 'south', facility: 'South General', distance: '17.1 km', type: 'Hospital', stock: 39, surplus: 4, chain: 'Compliant Tier-1', expiry: 'Sep 2026', eligible: false, reason: 'Insufficient usable shelf life for the route and receiver buffer.' },
-  ],
-};
-
-export const simulation = {
-  horizon: 14,
-  scenarios: {
-    single: {
-      id: 'single', title: 'Single-donor pull', source: 'North PHC', status: 'Fails resilience threshold', tone: 'critical', result: 'North PHC stockout', copy: 'Pulling 35 vials triggers a critical donor risk on day 9.', before: [{ name: 'Chennai Central', days: 2.3, risk: 'critical' }, { name: 'North PHC', days: 10.6, risk: 'healthy' }], after: [{ name: 'Chennai Central', days: 7.0, risk: 'healthy' }, { name: 'North PHC', days: 0, risk: 'critical' }],
-    },
-    recommended: {
-      id: 'recommended', title: 'Recommended multi-source split', source: 'East Clinic + West Station', status: 'Passes resilience threshold', tone: 'healthy', result: 'All sites retain safe coverage', copy: 'Split sourcing resolves the destination risk without creating a new donor stockout in 30 days.', before: [{ name: 'Chennai Central', days: 2.3, risk: 'critical' }, { name: 'East Clinic', days: 12.0, risk: 'healthy' }, { name: 'West Station', days: 8.8, risk: 'healthy' }], after: [{ name: 'Chennai Central', days: 7.0, risk: 'healthy' }, { name: 'East Clinic', days: 8.0, risk: 'healthy' }, { name: 'West Station', days: 5.8, risk: 'watch' }],
-    },
-  },
-  impact: { saved: 142, warnings: 0, confidence: '82% confidence', notes: 'Projection considers current inventory buffers, regional vehicle availability, and weather status parameters.' },
-};
-
-export const plan = {
-  id: 'PLAN-241', status: 'proposed', target: 'Chennai Central', medicine: 'Human Insulin 100 IU/mL', presentation: '100 IU/mL vial', rationale: 'A 20/15 split meets the target buffer while preserving protected coverage at both source facilities.', warning: 'Ensure cold-chain continuity during both transfers. This decision support does not replace licensed pharmacist oversight.', transfers: [
-    { source: 'East Clinic', quantity: 20, remaining: 40, distance: '6.5 km', constraint: 'Cold-chain compliant · expires Oct 2026' },
-    { source: 'West Station', quantity: 15, remaining: 27, distance: '22.8 km', constraint: 'Confirm transit temperature log · expires Jan 2027' },
-  ],
-  summary: { total: 35, projectedLife: '7 days', uncertainty: '18% · low', noNewStockouts: true },
-};
-
-export const audit = [
-  { id: 'LEG-082', event: 'Simulation simulated', detail: 'Sourced 35 vials safely for Chennai Central', meta: 'East Clinic (20) and West Station (15) split', actor: 'Dr. A. Vance', at: '12 minutes ago', status: 'proposed', source: 'Scenario engine' },
-  { id: 'LED-884', event: 'Alert overridden', detail: 'Bypassed single-donor sourcing route', meta: 'North PHC downstream warning flagged', actor: 'System auto-audit', at: '3 hours ago', status: 'bypass', source: 'Safety rule' },
-  { id: 'LMD-411', event: 'Inventory logged', detail: 'Chennai Central stock reported below threshold', meta: 'Insulin count reached 12 vials', actor: 'Sensor node CH-A1', at: '4 hours ago', status: 'critical', source: 'IoT gateway' },
-  { id: 'LED-620', event: 'Replenishment delayed', detail: 'Supplier arrival moved by two days', meta: 'Ceftriaxone 1 g · ETA now in 6 days', actor: 'Ops desk', at: '7 hours ago', status: 'watch', source: 'Inventory API' },
+export const mockMedicines = [
+  { id: 'MOCK-MED-1', genericName: 'Mock Insulin', strength: '100 IU/mL', dosageForm: 'Vial', unit: 'mL', criticality: 'CRITICAL', storage: '2-8 C', requiresColdChain: true },
+  { id: 'MOCK-MED-2', genericName: 'Mock Auto-Injector', strength: '1 mg', dosageForm: 'Pen', unit: 'count', criticality: 'CRITICAL', storage: '15-25 C', requiresColdChain: false },
 ];
+
+const insulin = mockMedicines[0];
+
+export const mockFacilities = [
+  { id: 'MOCK-WH-001', facilityId: 'MOCK-WH-001', name: 'Mock Regional Warehouse', type: 'Warehouse', district: 'Mock District', medicineId: insulin.id, medicine: insulin, effectiveStock: 5000, dailyDemand: 0, daysRemaining: null, protectedStock: 0, riskLabel: 'LOW', riskScore: 0, dataFreshness: 'MOCK DATA' },
+  { id: 'MOCK-DH-001', facilityId: 'MOCK-DH-001', name: 'Mock District Hospital', type: 'DistrictHospital', district: 'Mock District', medicineId: insulin.id, medicine: insulin, effectiveStock: 900, dailyDemand: 50, daysRemaining: 18, protectedStock: 700, riskLabel: 'LOW', riskScore: 14, dataFreshness: 'MOCK DATA' },
+  { id: 'MOCK-PHC-001', facilityId: 'MOCK-PHC-001', name: 'Mock Primary Health Centre', type: 'PHC', district: 'Mock District', medicineId: insulin.id, medicine: insulin, effectiveStock: 30, dailyDemand: 40, daysRemaining: 0.8, protectedStock: 560, riskLabel: 'CRITICAL', riskScore: 92, dataFreshness: 'MOCK DATA' },
+];
+
+export const mockSummary = {
+  resilienceScore: 60,
+  earliestStockout: { facilityId: 'MOCK-PHC-001', facilityName: 'Mock Primary Health Centre', daysRemaining: 0.8 },
+  criticalFacilityCount: 1,
+  alerts: [{ facilityId: 'MOCK-PHC-001', riskLabel: 'CRITICAL', cause: 'LOW_SIMULATED_COVERAGE', daysRemaining: 0.8 }],
+  dataFreshness: 'MOCK DATA',
+};
+
+export function mockInventory(facilityId, medicineId) {
+  const facility = mockFacilities.find((item) => item.id === facilityId);
+  const medicine = mockMedicines.find((item) => item.id === medicineId);
+  if (!facility || !medicine) return null;
+  const effective = medicine === insulin ? facility.effectiveStock : 0;
+  return {
+    facility: { id: facility.id, name: facility.name, type: facility.type },
+    medicine,
+    recordedStock: effective,
+    effectiveStock: effective,
+    excludedStock: 0,
+    dailyConsumption: medicine === insulin ? facility.dailyDemand : 0,
+    incomingReplenishment: facility.id === 'MOCK-PHC-001' && medicine === insulin ? { quantity: 600, expectedArrivalDate: '2026-09-19', status: 'DELAYED' } : null,
+    batches: effective ? [{ batchId: 1, batchNo: `MOCK-${facility.id}-B1`, quantity: effective, expiryDate: '2028-02-29', status: 'AVAILABLE' }] : [],
+    fixtureAssumptions: ['MOCK DATA'],
+  };
+}
+
+export const mockForecast = {
+  forecast: { dailyDemand: 40, lowerBound: 36, upperBound: 44, horizonDays: 14, unit: 'mL', method: 'MOCK DATA' },
+  risk: { score: 84, label: 'CRITICAL', components: [] },
+  stockout: {
+    daysRemaining: 0.8, projectedWithinHorizon: true, projectedStockoutDay: 1, projectedStockoutDate: '2026-09-12', shortageGapDays: 7,
+    minimumProjectedStock: 0, totalShortageDays: 7, unmetDemand: 250, supplyRestoredDay: 8, replenishmentTiming: 'AFTER_STOCKOUT', replenishmentArrivesBeforeStockout: false,
+    nextReplenishment: { quantity: 600, arrivalDay: 8, arrivalDate: '2026-09-19', status: 'DELAYED' },
+  },
+  confidence: { label: 'LOW', reason: 'MOCK DATA: no real consumption history.', validRecords: 0, missingOrInvalidRecords: 0, anomalyCount: 0, recentVariabilityCv: null },
+  cause: 'SUPPLY_DELAY',
+  contributingFactors: ['SUPPLY_DELAY'],
+  explanation: 'MOCK DATA: stock runs out before the delayed delivery arrives.',
+  assumptions: ['MOCK DATA'],
+  decisionSupportOnly: true,
+  inventory: { protectedStock: 560, protectedStockSource: 'FACILITY_SAFETY_STOCK', nextReplenishment: { quantity: 600, arrivalDay: 8, arrivalDate: '2026-09-19', status: 'DELAYED' } },
+  projection: Array.from({ length: 14 }, (_, index) => ({
+    day: index + 1, date: `2026-09-${String(12 + index).padStart(2, '0')}`,
+    closingStock: [0, 0, 0, 0, 0, 0, 0, 560, 520, 480, 440, 400, 360, 320][index],
+    unmetDemand: index < 7 ? [10, 40, 40, 40, 40, 40, 40][index] : 0,
+  })),
+  dataLabel: 'MOCK DATA',
+  modelVersion: 'mock-forecast',
+  source: 'MOCK_DATA',
+};
+
+export const mockPlanRequest = { destinationFacilityId: 'MOCK-PHC-001', medicineId: insulin.id, quantity: 250, horizonDays: 14 };
+
+function facilityState(id, name, role, daysRemaining, riskLabel, riskScore, stockoutDay) {
+  return { facilityId: id, facilityName: name, role, daysRemaining, riskLabel, riskScore, stockoutDay, shortageDays: stockoutDay ? 7 : 0, unmetDemand: stockoutDay ? 250 : 0 };
+}
+
+export const mockPlan = {
+  id: 'plan-mock-0001',
+  status: 'PROPOSED',
+  medicine: insulin,
+  destinationFacilityId: 'MOCK-PHC-001',
+  destinationFacilityName: 'Mock Primary Health Centre',
+  requestedQuantity: 250,
+  allocatedQuantity: 250,
+  unit: 'mL',
+  horizonDays: 14,
+  transfers: [{
+    fromFacilityId: 'MOCK-WH-001', fromFacilityName: 'Mock Regional Warehouse', toFacilityId: 'MOCK-PHC-001', toFacilityName: 'Mock Primary Health Centre',
+    medicineId: insulin.id, batchId: 1, batchNo: 'MOCK-MOCK-WH-001-B1', expiryDate: '2028-02-29', quantity: 250, unit: 'mL',
+    departureDay: 1, arrivalDay: 1, arrivalDate: '2026-09-12', distanceKm: 100, travelHours: 2.5, coldChainAvailable: true,
+  }],
+  recipient: { facilityId: 'MOCK-PHC-001', facilityName: 'Mock Primary Health Centre', stockoutDayBefore: 1, stockoutDayAfter: null, shortageDaysBefore: 7, shortageDaysAfter: 0, unmetDemandBefore: 250, unmetDemandAfter: 0, stockoutPrevented: true },
+  candidates: [
+    { facilityId: 'MOCK-WH-001', facilityName: 'Mock Regional Warehouse', facilityType: 'Warehouse', status: 'SELECTED', rejectionCodes: [], rejectionReasons: [], effectiveStock: 5000, protectedStock: 0, retainedFloor: 500, futureReplenishmentExcluded: 0, safeCapacity: 4500, allocatedQuantity: 250, baselineRiskLabel: 'LOW', baselineRiskScore: 0, distanceKm: 100, travelHours: 2.5, explanation: 'MOCK DATA: selected donor.' },
+    { facilityId: 'MOCK-DH-001', facilityName: 'Mock District Hospital', facilityType: 'DistrictHospital', status: 'REJECTED', rejectionCodes: ['NO_SAFE_DONOR_CAPACITY'], rejectionReasons: ['MOCK DATA: counting only stock already received, this donor has no safe surplus.'], effectiveStock: 900, protectedStock: 700, retainedFloor: 780.5, futureReplenishmentExcluded: 700, safeCapacity: 0, allocatedQuantity: 0, baselineRiskLabel: 'LOW', baselineRiskScore: 14, distanceKm: 40, travelHours: 1.2, explanation: 'MOCK DATA: rejected donor.' },
+  ],
+  equityGuardrail: { maxTravelHours: 6, donorCapacityBasis: 'RECEIVED_STOCK_ONLY' },
+  rationale: 'MOCK DATA: the warehouse covers the shortage and keeps its retained floor.',
+  validation: { validator: 'mock-simulator', passed: true, checks: [
+    { name: 'ALL_TRANSFERS_ELIGIBLE', passed: true, detail: 'MOCK DATA' },
+    { name: 'DONORS_SAFE_WITHOUT_FUTURE_SUPPLY', passed: true, detail: 'MOCK DATA' },
+    { name: 'SAFE_TO_RECOMMEND', passed: true, detail: 'MOCK DATA' },
+  ] },
+  assumptions: ['MOCK DATA'],
+  limitations: ['MOCK DATA is not a safety result.'],
+  simulation: {
+    baseline: { facilities: [facilityState('MOCK-WH-001', 'Mock Regional Warehouse', 'DONOR', null, 'LOW', 0, null), facilityState('MOCK-PHC-001', 'Mock Primary Health Centre', 'RECIPIENT', 0.8, 'CRITICAL', 84, 1)] },
+    intervention: { facilities: [facilityState('MOCK-WH-001', 'Mock Regional Warehouse', 'DONOR', null, 'LOW', 0, null), facilityState('MOCK-PHC-001', 'Mock Primary Health Centre', 'RECIPIENT', 7, 'MEDIUM', 40, null)] },
+    transferEvaluations: [],
+    comparison: { safeToRecommend: true, newShortagesCreated: [], newCriticalFacilities: [], newRisks: [], summary: 'MOCK DATA' },
+    maxTravelHours: 6,
+    receivedStockCheck: { basis: 'RECEIVED_STOCK_ONLY', passed: true, donors: [{ facilityId: 'MOCK-WH-001', facilityName: 'Mock Regional Warehouse', totalSent: 250, retainedFloor: 500, lowestProjectedStock: 4750, lowestProjectedDay: 1, futureReplenishmentExcluded: 0, passed: true, failureCodes: [], explanation: 'MOCK DATA' }], explanation: 'MOCK DATA' },
+    decisionSupportOnly: true,
+    modelVersion: 'mock-simulator',
+  },
+  decisionSupportOnly: true,
+  requiresHumanApproval: true,
+  dataContext: { dataSource: 'MOCK_DATA' },
+  dataLabel: 'MOCK DATA',
+  modelVersion: 'mock-optimizer',
+  source: 'MOCK_DATA',
+};
+
+export const mockNoSafePlan = {
+  code: 'NO_SAFE_PLAN',
+  message: `MOCK DATA: only the sample request (${mockPlanRequest.quantity} mL of Mock Insulin for Mock Primary Health Centre over 14 days) has a sample plan.`,
+  details: {
+    requestedQuantity: null, safeCapacity: 0, unmetQuantity: null, unit: 'mL', solverStatus: 'INFEASIBLE',
+    eligibleCandidates: [], rejectedCandidates: [mockPlan.candidates[1]],
+    recommendedEscalation: ['MOCK DATA: run the sample request, or connect the API for a real assessment.'],
+    equityGuardrail: mockPlan.equityGuardrail,
+  },
+};
