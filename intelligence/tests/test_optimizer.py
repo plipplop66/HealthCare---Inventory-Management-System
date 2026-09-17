@@ -239,8 +239,8 @@ def test_allocation_is_split_across_batches_with_decimals_preserved():
     assert {(item["departureDay"], item["arrivalDay"]) for item in body["transfers"]} == {(1, 1)}
     assert (body["requestedQuantity"], body["allocatedQuantity"], total(body), body["solver"]["quantityScale"]) == (600.25, 600.25, 600.25, 100)
     assert [item["batches"] for item in body["simulation"]["transferEvaluations"]] == [
-        [{"batchNo": "SIM-007-B01", "quantity": 200.5, "expiryDate": "2028-02-29"}],
-        [{"batchNo": "SIM-007-B02", "quantity": 399.75, "expiryDate": "2028-04-24"}],
+        [{"batchId": 13, "batchNo": "SIM-007-B01", "quantity": 200.5, "expiryDate": "2028-02-29"}],
+        [{"batchId": 14, "batchNo": "SIM-007-B02", "quantity": 399.75, "expiryDate": "2028-04-24"}],
     ]
 
 

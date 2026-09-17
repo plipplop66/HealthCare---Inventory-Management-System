@@ -79,7 +79,7 @@ def test_safe_transfer_prevents_the_recipient_stockout(client):
     item = evaluation(body)
     assert (item["eligible"], item["applied"], item["departureDay"], item["rejectionCodes"]) == (True, True, 1, [])
     assert item["route"] == {"distanceKm": 210.25, "travelHours": 5.1, "coldChainAvailable": True}
-    assert item["batches"] == [{"batchNo": "SIM-007-B02", "quantity": 600.0, "expiryDate": "2028-04-24"}]
+    assert item["batches"] == [{"batchId": None, "batchNo": "SIM-007-B02", "quantity": 600.0, "expiryDate": "2028-04-24"}]
     after = facility(body["intervention"], "PHC-SIM-001")
     assert (after["stockoutDay"], after["unmetDemand"], after["riskScore"], after["riskLabel"]) == (None, 0.0, 36, "MEDIUM")
     warehouse = facility(body["intervention"], "WH-SIM-001")
@@ -107,7 +107,7 @@ def test_transfer_below_donor_protected_stock_is_rejected_but_simulated(client):
     assert [(risk["riskType"], risk["facilityId"]) for risk in comparison["newRisks"]] == [("FELL_BELOW_PROTECTED_STOCK", "DH-SIM-001")]
     assert comparison["safeToRecommend"] is False
     # Earliest-expiry usable batch first; the quarantined batch is never sent.
-    assert item["batches"] == [{"batchNo": "SIM-007-B01", "quantity": 400.0, "expiryDate": "2028-02-29"}]
+    assert item["batches"] == [{"batchId": None, "batchNo": "SIM-007-B01", "quantity": 400.0, "expiryDate": "2028-02-29"}]
 
 
 def test_recipient_saved_but_donor_becomes_critical_is_not_safe(client):

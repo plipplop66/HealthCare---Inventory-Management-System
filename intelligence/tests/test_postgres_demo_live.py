@@ -220,6 +220,9 @@ def test_vellore_ripple_simulation_is_safe(client, ids):
     assert item["route"] == {"distanceKm": 124.7, "travelHours": 3.19, "coldChainAvailable": True}
     assert body["comparison"]["safeToRecommend"] is True and body["comparison"]["recipientStockoutPrevented"] is True
     assert body["scenarioType"] == "SIMULATED_DATABASE"
+    assert [(batch["batchId"], batch["batchNo"], batch["quantity"]) for batch in item["batches"]] == [
+        (ids["batches"]["TN-007-B01-26"], "TN-007-B01-26", 300.0)]
+    assert (body["maxTravelHours"], body["receivedStockCheck"]["passed"]) == (6.0, True)
 
 
 # ---- 2 and 3. A clinical donor using received stock only, in a two-donor plan ----
@@ -256,6 +259,11 @@ def test_two_donor_plan(client, ids, settings, karur):
         assert t["batchNo"] == first
     assert all(checks(karur).values()) and karur["simulation"]["comparison"]["safeToRecommend"] is True
     assert karur["simulation"]["comparison"]["newShortagesCreated"] == []
+    # Re-simulating the plan's exact transfers, as the backend does before approval, reproduces its donor evidence.
+    status, again, _ = post(client, "/scenarios/simulate", {"horizonDays": HORIZON, "transfers": [
+        {key: t[key] for key in ("fromFacilityId", "toFacilityId", "medicineId", "quantity", "arrivalDay")} for t in transfers]})
+    assert status == 200 and again["comparison"]["safeToRecommend"] is True
+    assert again["receivedStockCheck"] == karur["simulation"]["receivedStockCheck"] and again["receivedStockCheck"]["passed"] is True
     assert (karur["recipient"]["stockoutDayBefore"], karur["recipient"]["stockoutDayAfter"]) == (2, None)
     assert plan(client, ids, "PHC-KRR-001", 800)[2] == plan(client, ids, "PHC-KRR-001", 800)[2]
 
@@ -339,6 +347,10 @@ def test_future_supply_dependent_donor_is_rejected(client, ids, karur):
     # The simulator counts the scheduled delivery, which is the only reason the transfer looks safe there.
     status, body, _ = simulate(client, ids, "CHC-SLM-001", "PHC-KRR-001", 100)
     assert body["transferEvaluations"][0]["eligible"] is True
+    # Its received-stock evidence fails, so the backend would not reserve this transfer.
+    evidence = body["receivedStockCheck"]["donors"][0]
+    assert body["receivedStockCheck"]["passed"] is False and evidence["facilityId"] == "CHC-SLM-001"
+    assert "BELOW_RETAINED_FLOOR" in evidence["failureCodes"] and evidence["futureReplenishmentExcluded"] == 1745.5
 
 
 # ---- Read-only and deterministic ----

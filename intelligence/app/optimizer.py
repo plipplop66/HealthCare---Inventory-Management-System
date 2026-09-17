@@ -71,6 +71,8 @@ from .schemas import (
     PlanResponse,
     PlanTransferBlock,
     PlanValidationBlock,
+    ReceivedStockCheckBlock,
+    ReceivedStockDonorBlock,
     RecipientPlanBlock,
     SimulationDataContextBlock,
     SimulationMedicineBlock,
@@ -133,6 +135,10 @@ DONOR_AT_RISK = "DONOR_AT_RISK"
 NO_SAFE_DONOR_CAPACITY = "NO_SAFE_DONOR_CAPACITY"
 CAPACITY_NOT_VERIFIED = "CAPACITY_NOT_VERIFIED"
 SIMULATION_REJECTED = "SIMULATION_REJECTED"
+# Received-stock evidence for any simulated plan (received_stock_evidence).
+WITHDRAWAL_EXCEEDS_RECEIVED_STOCK = "WITHDRAWAL_EXCEEDS_RECEIVED_STOCK"
+BELOW_RETAINED_FLOOR = "BELOW_RETAINED_FLOOR"
+DONOR_DATA_UNAVAILABLE = "DONOR_DATA_UNAVAILABLE"
 
 
 class OptimizationError(Exception):
@@ -376,13 +382,37 @@ def consumption_description(state: FacilityState, unit: str) -> str:
     return f"forecast consumption of {_number(state.demand)} {_per_day(unit)}"
 
 
-def received_stock_projection(scenario: Scenario, state: FacilityState, withdrawals: Mapping[int, float] | None = None) -> StockProjection:
+@dataclass(frozen=True)
+class DonorFloor:
+    equity_uplift: float
+    equity_reserve: float
+    operational_reserve: float | None
+    retained_floor: float
+
+
+def donor_floor(state: FacilityState, config: OptimizerConfig) -> DonorFloor:
+    """The stock a donor must keep: max(protected stock + equity reserve, operational reserve), each rounded up."""
+    facility = state.facility
+    equity_uplift = config.equity_uplift(facility)
+    equity_reserve = ceil_hundredths(state.protected_stock * equity_uplift)
+    operational_reserve = None
+    if facility.type.upper() in STORAGE_FACILITY_TYPES:
+        operational_reserve = ceil_hundredths(config.warehouse_operational_reserve_share * state.effective_stock)
+    retained_floor = ceil_hundredths(max(state.protected_stock + equity_reserve, operational_reserve or 0.0))
+    return DonorFloor(equity_uplift, equity_reserve, operational_reserve, retained_floor)
+
+
+def project_received_stock(state: FacilityState, horizon_days: int, as_of: date, withdrawals: Mapping[int, float] | None = None) -> StockProjection:
     """A donor's day-by-day projection from stock already received: the forecast engine's projection with no replenishment.
 
-    Only donor capacity uses it. The recipient, POST /forecast and the Ripple Simulator keep scheduled and delayed
+    Only donor safety uses it. The recipient, POST /forecast and the Ripple Simulator keep scheduled and delayed
     replenishments; ARRIVED stock is already part of effective stock and is never projected again.
     """
-    return project_stock(state.effective_stock, state.demand, scenario.horizon_days, (), start_date=scenario.store.as_of, withdrawals=withdrawals)
+    return project_stock(state.effective_stock, state.demand, horizon_days, (), start_date=as_of, withdrawals=withdrawals)
+
+
+def received_stock_projection(scenario: Scenario, state: FacilityState, withdrawals: Mapping[int, float] | None = None) -> StockProjection:
+    return project_received_stock(state, scenario.horizon_days, scenario.store.as_of, withdrawals)
 
 
 def future_supply(scenario: Scenario, state: FacilityState) -> tuple[Replenishment, ...]:
@@ -484,11 +514,9 @@ def assess_candidate(scenario: Scenario, facility: Facility) -> Candidate:
 
     candidate.received_projection = received_stock_projection(scenario, state)
     candidate.excluded_replenishments = future_supply(scenario, state)
-    candidate.equity_uplift = config.equity_uplift(facility)
-    candidate.equity_reserve = ceil_hundredths(state.protected_stock * candidate.equity_uplift)
-    if facility.type.upper() in STORAGE_FACILITY_TYPES:
-        candidate.operational_reserve = ceil_hundredths(config.warehouse_operational_reserve_share * state.effective_stock)
-    candidate.retained_floor = ceil_hundredths(max(state.protected_stock + candidate.equity_reserve, candidate.operational_reserve or 0.0))
+    floor = donor_floor(state, config)
+    candidate.equity_uplift, candidate.equity_reserve = floor.equity_uplift, floor.equity_reserve
+    candidate.operational_reserve, candidate.retained_floor = floor.operational_reserve, floor.retained_floor
 
     as_of = scenario.store.as_of
     if state.effective_stock <= EPSILON:
@@ -707,6 +735,82 @@ def received_stock_check(scenario: Scenario, transfers: Sequence[PlannedTransfer
         "Counting only stock already received, every donor keeps its retained floor from departure to the end of the horizon.",
         f"Donors that would rely on future supply: {'; '.join(unsafe)}.",
     )
+
+
+def received_stock_evidence(result: SimulationResult, config: OptimizerConfig = DEFAULT_OPTIMIZER_CONFIG) -> ReceivedStockCheckBlock:
+    """The optimizer's donor rules applied to any simulated set of transfers, counting only stock already received.
+
+    Each donor's applied withdrawals leave on their departure days, no scheduled, delayed or other future supply is
+    counted, and the lowest closing stock from the first departure day must stay at or above the retained floor
+    (DONORS_SAFE_WITHOUT_FUTURE_SUPPLY). A donor also fails when a forecast facility has no recorded safety stock or when
+    it is already HIGH or CRITICAL without the transfers, as a candidate would. This is evidence alongside the simulation:
+    transfer eligibility and safeToRecommend are unchanged. The backend requires it to pass before reserving stock.
+    """
+    unit, horizon_days, as_of = result.medicine.unit, result.horizon_days, result.store.as_of
+    schedules: dict[str, dict[int, int]] = {}
+    for evaluation in result.evaluations:
+        if evaluation.applied and evaluation.departure_day is not None:
+            schedule = schedules.setdefault(evaluation.transfer.from_facility_id, {})
+            schedule[evaluation.departure_day] = schedule.get(evaluation.departure_day, 0) + scaled(evaluation.transfer.quantity)
+
+    donors = []
+    for facility_id, schedule in schedules.items():
+        state, first_day = result.states.get(facility_id), min(schedule)
+        total_sent = unscaled(sum(schedule.values()))
+        if state is None or not state.available:
+            reason = state.unavailable_reason if state is not None else "it has no inventory record for this medicine."
+            donors.append(ReceivedStockDonorBlock(
+                facility_id=facility_id, facility_name=state.facility.name if state is not None else facility_id, total_sent=total_sent,
+                retained_floor=0.0, lowest_projected_stock=0.0, lowest_projected_day=first_day, future_replenishment_excluded=0.0,
+                passed=False, failure_codes=[DONOR_DATA_UNAVAILABLE], explanation=f"{facility_id} cannot be projected: {reason}",
+            ))
+            continue
+        name, floor = state.facility.name, donor_floor(state, config)
+        projection = project_received_stock(state, horizon_days, as_of, {day: unscaled(units) for day, units in sorted(schedule.items())})
+        lowest = min(projection.days[first_day - 1:], key=lambda day: day.closing_stock)
+        excluded = unscaled(sum(scaled(item.quantity) for item in state.inventory.replenishments if 1 <= item.arrival_day <= horizon_days))
+        failures: list[tuple[str, str]] = []
+        if projection.withdrawal_shortfall > EPSILON:
+            failures.append((
+                WITHDRAWAL_EXCEEDS_RECEIVED_STOCK,
+                f"{name} does not hold {_quantity(projection.withdrawal_shortfall, unit)} of the stock it would send without future supply.",
+            ))
+        if lowest.closing_stock < floor.retained_floor - EPSILON:
+            failures.append((
+                BELOW_RETAINED_FLOOR,
+                f"Counting only stock already received, the lowest projected stock at {name} from day {first_day} would be "
+                f"{_quantity(lowest.closing_stock, unit)} on day {lowest.day}, below its retained floor of {_quantity(floor.retained_floor, unit)}.",
+            ))
+        if state.inventory.protected_stock_source == PROTECTED_STOCK_NOT_RECORDED and state.demand_basis == FORECAST:
+            failures.append((SAFETY_STOCK_NOT_RECORDED, f"{name} has no recorded safety stock, so a safe donor floor cannot be established."))
+        risk = result.baseline[facility_id].risk
+        if risk is not None and risk.label in config.excluded_donor_risk_labels:
+            failures.append((DONOR_AT_RISK, f"{name} is already {risk.label} risk ({risk.score}) without any transfer, so it is not asked to donate."))
+        if failures:
+            explanation = " ".join(message for _, message in failures)
+        else:
+            explanation = (
+                f"Counting only stock already received, {name} keeps its retained floor of {_quantity(floor.retained_floor, unit)} after "
+                f"sending {_quantity(total_sent, unit)}: its lowest projected stock from day {first_day} is "
+                f"{_quantity(lowest.closing_stock, unit)} on day {lowest.day}."
+            )
+        if excluded > EPSILON:
+            explanation += f" Future supply of {_quantity(excluded, unit)} due within the horizon is not counted."
+        donors.append(ReceivedStockDonorBlock(
+            facility_id=facility_id, facility_name=name, total_sent=total_sent, retained_floor=floor.retained_floor,
+            lowest_projected_stock=round(lowest.closing_stock, 2), lowest_projected_day=lowest.day, future_replenishment_excluded=excluded,
+            passed=not failures, failure_codes=[code for code, _ in failures], explanation=explanation,
+        ))
+
+    passed = bool(donors) and all(donor.passed for donor in donors)
+    if not donors:
+        explanation = "No transfer was applied, so no donor safety can be shown and nothing can be recommended."
+    elif passed:
+        explanation = "Counting only stock already received, every donor keeps its retained floor from departure to the end of the horizon."
+    else:
+        failed = ", ".join(donor.facility_id for donor in donors if not donor.passed)
+        explanation = f"Donors that fail the donor rules on stock already received: {failed}."
+    return ReceivedStockCheckBlock(basis=RECEIVED_STOCK_ONLY, passed=passed, donors=donors, explanation=explanation)
 
 
 def reject_failing_donors(candidates: Sequence[Candidate], transfers: Sequence[PlannedTransfer], result: SimulationResult, simulation: SimulationResponse) -> bool:
@@ -1266,7 +1370,7 @@ def run_optimization(
             for transfer in transfers
         ]
         result = simulate(store, proposed, scenario.horizon_days, risk_config, scenario.config.max_travel_hours)
-        simulation = build_simulation_response(result)
+        simulation = build_simulation_response(result, received_stock_evidence(result, config))
         checks = validation_checks(scenario, transfers, result, simulation)
         if all(item.passed for item in checks):
             return build_plan(scenario, candidates, transfers, allocation, attempts, result, simulation, checks)

@@ -353,6 +353,7 @@ class RouteBlock(ApiModel):
 
 
 class BatchAllocationBlock(ApiModel):
+    batch_id: int | None = Field(default=None, description="batches.batch_id; null for the fixture, which only has batch numbers.")
     batch_no: str
     quantity: float
     expiry_date: dt.date
@@ -443,6 +444,30 @@ class SimulationDataContextBlock(ApiModel):
     notes: list[str]
 
 
+class ReceivedStockDonorBlock(ApiModel):
+    facility_id: str
+    facility_name: str
+    total_sent: float
+    retained_floor: float = Field(description="Protected stock plus the equity or operational reserve, as the optimizer applies it.")
+    lowest_projected_stock: float = Field(description="Lowest closing stock from the first departure day, counting only stock already received.")
+    lowest_projected_day: int
+    future_replenishment_excluded: float = Field(description="Scheduled or delayed stock due within the horizon that this check does not count.")
+    passed: bool
+    failure_codes: list[str] = Field(
+        description="WITHDRAWAL_EXCEEDS_RECEIVED_STOCK, BELOW_RETAINED_FLOOR, SAFETY_STOCK_NOT_RECORDED, DONOR_AT_RISK or DONOR_DATA_UNAVAILABLE; empty when passed."
+    )
+    explanation: str
+
+
+class ReceivedStockCheckBlock(ApiModel):
+    """Donor safety counting only stock already received: evidence alongside, not part of, transfer eligibility."""
+
+    basis: Literal["RECEIVED_STOCK_ONLY"]
+    passed: bool = Field(description="True only when at least one transfer was applied and every donor passes.")
+    donors: list[ReceivedStockDonorBlock]
+    explanation: str
+
+
 class SimulationResponse(ApiModel):
     scenario_type: Literal["SIMULATED_FIXTURE", "SIMULATED_DATABASE"]
     horizon_days: int
@@ -452,6 +477,12 @@ class SimulationResponse(ApiModel):
     intervention: RegionalStateBlock
     transfer_evaluations: list[TransferEvaluationBlock]
     comparison: SimulationComparisonBlock
+    max_travel_hours: float = Field(description="The route limit applied; a longer route is ineligible (TRAVEL_TIME_LIMIT_EXCEEDED).")
+    received_stock_check: ReceivedStockCheckBlock | None = Field(
+        default=None,
+        description="Donor safety counting only stock already received. It does not change eligibility or safeToRecommend; "
+        "the Node backend requires it to pass before reserving stock.",
+    )
     assumptions: list[str]
     limitations: list[str]
     decision_support_only: Literal[True] = True

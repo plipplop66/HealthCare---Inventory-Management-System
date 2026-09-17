@@ -287,8 +287,10 @@ Malformed requests return 422 `INVALID_REQUEST`. If none of the requested medici
 | `medicine` | `id`, `genericName`, `strength`, `dosageForm`, `unit`, `criticality`, `requiresColdChain` |
 | `baseline`, `intervention` | `criticalFacilityCount`, `stockoutFacilityCount`, `regionalShortageDays`, `regionalUnmetDemand`, `regionalRisk` (highest facility score), `averageRisk`, `appliedTransferCount`, `facilities[]` |
 | `facilities[]` | `facilityId`, `facilityName`, `role`, `effectiveStock`, `transferIn`, `transferOut`, `stockAfterTransfers`, `protectedStock`, `predictedDailyDemand`, `demandBasis`, `daysRemaining`, `stockoutDay` / `stockoutDate`, `shortageDays`, `unmetDemand`, `minimumProjectedStock`, `endingStock`, `belowProtectedStock`, `riskScore`, `riskLabel`, and `projectedDailyStock[]` (`openingStock`, `transferOut`, `scheduledReplenishment`, `transferIn`, `demand`, `closingStock`, `unmetDemand` per day) |
-| `transferEvaluations[]` | The request fields plus `departureDay`, `eligible`, `applied`, `rejectionReasons[]`, `rejectionCodes[]`, `route` (`distanceKm`, `travelHours`, `coldChainAvailable`), `batches[]` and a plain-language `explanation` |
+| `transferEvaluations[]` | The request fields plus `departureDay`, `eligible`, `applied`, `rejectionReasons[]`, `rejectionCodes[]`, `route` (`distanceKm`, `travelHours`, `coldChainAvailable`), `batches[]` (`batchId`, null for the fixture; `batchNo`, `quantity`, `expiryDate`) and a plain-language `explanation` |
 | `comparison` | `recipientStockoutPrevented`, `recipientOutcomes[]`, `newShortagesCreated[]`, `newCriticalFacilities[]`, `newRisks[]`, `improvedFacilities[]`, `worsenedFacilities[]`, shortage days and unmet demand before/after with `shortageDaysPrevented` and `unmetDemandReduced`, `criticalFacilityDelta`, `regionalRiskBefore` / `regionalRiskAfter`, `regionalOutcome` (`IMPROVED`, `WORSENED`, `MIXED`, `UNCHANGED`), `safeToRecommend` and `summary` |
+| `maxTravelHours` | The route limit applied (6 hours by default) |
+| `receivedStockCheck` | Donor evidence on stock already received: `basis` (`RECEIVED_STOCK_ONLY`), `passed`, `explanation` and `donors[]` (`facilityId`, `facilityName`, `totalSent`, `retainedFloor`, `lowestProjectedStock`, `lowestProjectedDay`, `futureReplenishmentExcluded`, `passed`, `failureCodes[]`, `explanation`); see [Received-stock donor evidence](#received-stock-donor-evidence) |
 | `assumptions`, `limitations`, `decisionSupportOnly`, `dataContext` | Modelling rules, known gaps, always `true`, and data source, simulation and as-of dates, history window, unit, mappings and notes |
 
 `scenarioType` (`SIMULATED_DATABASE` or `SIMULATED_FIXTURE`) and `medicineId` match the Node response.
@@ -333,6 +335,20 @@ A storage facility (warehouse) without consumption records is projected with zer
 A recipient that is already critical is never a reason to reject; helping it is the purpose.
 
 **`safeToRecommend`** is true only when at least one transfer was simulated, every transfer is eligible, no facility gains a new risk (`NEW_STOCKOUT`, `MORE_SHORTAGE`, `NEW_CRITICAL`, `NEW_HIGH_RISK` or `FELL_BELOW_PROTECTED_STOCK`), and regional shortage is `IMPROVED` or `UNCHANGED`. So a transfer that saves the recipient but makes a donor critical returns `recipientStockoutPrevented: true`, the donor in `newShortagesCreated`, and `safeToRecommend: false`.
+
+### Received-stock donor evidence
+
+The simulator counts a donor's scheduled and delayed deliveries, as `POST /forecast` does. The optimizer does not: a donor must be safe on stock already received. `receivedStockCheck` applies the optimizer's donor rules to the simulated transfers so a caller can check both. Every applied transfer leaves its donor on its departure day, and each donor is projected with no future supply, from the first departure day to the end of the horizon. A donor passes only if all of these hold:
+
+| Failure code | Rule |
+| --- | --- |
+| `WITHDRAWAL_EXCEEDS_RECEIVED_STOCK` | Its stock already received covers every withdrawal |
+| `BELOW_RETAINED_FLOOR` | Its lowest projected stock stays at or above the retained floor (protected stock plus the equity or operational reserve; the same `donor_floor` rule as optimizer candidates) |
+| `SAFETY_STOCK_NOT_RECORDED` | A facility with forecast consumption has recorded safety stock |
+| `DONOR_AT_RISK` | It is not already `HIGH` or `CRITICAL` without the transfers |
+| `DONOR_DATA_UNAVAILABLE` | It can be projected |
+
+`passed` is true only when at least one transfer was applied and every donor passes. The check is evidence only: it never changes `eligible`, `applied` or `safeToRecommend`. A donor that is safe only because of a delivery can therefore show `safeToRecommend: true` with `receivedStockCheck.passed: false`. For a plan returned by `POST /plans/optimize`, re-simulating its exact transfers gives the same passing check as `simulation.receivedStockCheck`. The Node backend requires `safeToRecommend`, eligible transfers and this check before it reserves stock.
 
 ### Data-source and unit rules
 
@@ -609,11 +625,11 @@ Where each item Samson's UI needs already appears (no duplicate fields were adde
 | Daily demand (depletion rate) | `forecast.dailyDemand` | `facilities[].predictedDailyDemand` | `recipient.predictedDailyDemand`, `candidates[].predictedDailyDemand` |
 | Risk score and label | `risk.score`, `risk.label` | `facilities[].riskScore`, `riskLabel` | `candidates[].baselineRiskScore`, `baselineRiskLabel`; after the plan `simulation.intervention.facilities[].riskScore`, `riskLabel` |
 | Stockout day and date | `stockout.projectedStockoutDay`, `projectedStockoutDate` | `facilities[].stockoutDay`, `stockoutDate` | `recipient.stockoutDayBefore`, `stockoutDayAfter`; dates in `simulation.baseline` / `simulation.intervention` `.facilities[].stockoutDate` |
-| Donor retained floor | - | - | `candidates[].retainedFloor` |
+| Donor retained floor | - | `receivedStockCheck.donors[].retainedFloor` | `candidates[].retainedFloor`, `simulation.receivedStockCheck.donors[].retainedFloor` |
 | Safe donor capacity | - | - | `candidates[].safeCapacity`; `NO_SAFE_PLAN` `details.safeCapacity` |
-| Future supply left out of donor capacity | - | - | `candidates[].futureReplenishmentExcluded` |
-| Route travel time and limit | - | `transferEvaluations[].route.travelHours` | `transfers[].travelHours`, `candidates[].travelHours`, `equityGuardrail.maxTravelHours` |
-| Batch ID and batch number | - | `transferEvaluations[].batches[].batchNo` | `transfers[].batchId`, `transfers[].batchNo` |
+| Future supply left out of donor capacity | - | `receivedStockCheck.donors[].futureReplenishmentExcluded` | `candidates[].futureReplenishmentExcluded` |
+| Route travel time and limit | - | `transferEvaluations[].route.travelHours`, `maxTravelHours` | `transfers[].travelHours`, `candidates[].travelHours`, `equityGuardrail.maxTravelHours` |
+| Batch ID and batch number | - | `transferEvaluations[].batches[].batchId`, `batchNo` | `transfers[].batchId`, `transfers[].batchNo` |
 | Rejection code and reason | - | `transferEvaluations[].rejectionCodes`, `rejectionReasons` | `candidates[].rejectionCodes`, `rejectionReasons`; `NO_SAFE_PLAN` `details.rejectedCandidates[]` |
 | Shortage days prevented | - | `comparison.shortageDaysPrevented` | `simulation.comparison.shortageDaysPrevented` |
 | Unmet demand reduced | - | `comparison.unmetDemandReduced` | `simulation.comparison.unmetDemandReduced` |
@@ -664,8 +680,9 @@ The optimizer test modules:
 - `tests/test_optimizer.py`: optimizer scenarios.
 - `tests/test_optimizer_api.py`: the API contract.
 - `tests/test_optimizer_review_rules.py`: the reviewed rules, namely the six-hour cap (in the optimizer and the Ripple Simulator, from one configured value), FEFO tie-breaking by batch ID, received-stock-only donors, approved guardrail values, exact identity, cold chain, `NO_SAFE_PLAN`, determinism and the absence of a patient-impact metric.
+- `tests/test_simulation_donor_evidence.py`: the simulator's `receivedStockCheck`, `maxTravelHours` and batch IDs, and that re-simulating a plan's exact transfers reproduces its passing evidence.
 
-All three run on in-memory rows (`tests/optimizer_support.py`), the fixture and the CP-SAT model directly. `tests/test_optimizer_live.py` runs against the seeded database only when `MEDRIPPLE_LIVE_MYSQL=1`. It covers the Vellore plan, database batches, the route cap on real routes and future supply matching the database:
+All four run on in-memory rows (`tests/optimizer_support.py`), the fixture and the CP-SAT model directly. `tests/test_optimizer_live.py` runs against the seeded database only when `MEDRIPPLE_LIVE_MYSQL=1`. It covers the Vellore plan, database batches, the route cap on real routes and future supply matching the database:
 
 ```powershell
 .\.venv\Scripts\python -m pytest tests/test_optimizer_review_rules.py

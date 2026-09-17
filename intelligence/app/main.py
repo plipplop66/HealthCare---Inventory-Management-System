@@ -32,7 +32,7 @@ from .forecast import (
 )
 from .allocation_solver import SolverUnavailableError
 from .mysql_store import Connector, DatabaseDataError, DatabaseUnavailableError, MySQLDataSource
-from .optimizer import DEFAULT_OPTIMIZER_CONFIG, NoSafePlanError, OptimizationError, OptimizerConfig, run_optimization
+from .optimizer import DEFAULT_OPTIMIZER_CONFIG, NoSafePlanError, OptimizationError, OptimizerConfig, received_stock_evidence, run_optimization
 from .simulator import SimulationError, run_simulation
 from .risk_engine import (
     DEFAULT_RISK_CONFIG,
@@ -477,8 +477,11 @@ def create_app(
     def simulate_scenario(payload: SimulationRequest) -> SimulationResponse:
         """Ripple Simulator: read-only before/after projection of proposed transfers. Decision support only."""
         store = data_source.regional_store_for([item.medicine_id for item in payload.transfers])
-        # The same configured route cap as POST /plans/optimize, so both endpoints agree.
-        return run_simulation(store, payload, risk_config, optimizer_config.max_travel_hours)
+        # The same configured route cap and donor rules as POST /plans/optimize, so both endpoints agree.
+        return run_simulation(
+            store, payload, risk_config, optimizer_config.max_travel_hours,
+            donor_evidence=lambda result: received_stock_evidence(result, optimizer_config),
+        )
 
     @app.exception_handler(OptimizationError)
     async def handle_optimization_error(request: Request, error: OptimizationError) -> JSONResponse:

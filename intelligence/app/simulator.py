@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import statistics
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -45,6 +45,7 @@ from .schemas import (
     FacilityChangeBlock,
     FacilityProjectionBlock,
     NewRiskBlock,
+    ReceivedStockCheckBlock,
     RecipientOutcomeBlock,
     RegionalStateBlock,
     RouteBlock,
@@ -973,7 +974,8 @@ def summarise(
     return " ".join(sentences)
 
 
-def build_simulation_response(result: SimulationResult) -> SimulationResponse:
+def build_simulation_response(result: SimulationResult, received_stock_check: ReceivedStockCheckBlock | None = None) -> SimulationResponse:
+    """received_stock_check is the optimizer's donor evidence (optimizer.received_stock_evidence); it never changes safeToRecommend."""
     store, medicine = result.store, result.medicine
     context = store.context
     applied = [evaluation for evaluation in result.evaluations if evaluation.applied]
@@ -1046,7 +1048,10 @@ def build_simulation_response(result: SimulationResult) -> SimulationResponse:
                 if evaluation.route
                 else None
             ),
-            batches=[BatchAllocationBlock(batch_no=batch.batch_no, quantity=_round(quantity), expiry_date=batch.expiry_date) for batch, quantity in evaluation.batches],
+            batches=[
+                BatchAllocationBlock(batch_id=batch.batch_id, batch_no=batch.batch_no, quantity=_round(quantity), expiry_date=batch.expiry_date)
+                for batch, quantity in evaluation.batches
+            ],
             explanation=explain_transfer(result, evaluation),
         )
         for evaluation in result.evaluations
@@ -1086,6 +1091,8 @@ def build_simulation_response(result: SimulationResult) -> SimulationResponse:
         intervention=intervention,
         transfer_evaluations=evaluations,
         comparison=comparison,
+        max_travel_hours=result.max_travel_hours,
+        received_stock_check=received_stock_check,
         assumptions=[
             *SIMULATION_ASSUMPTIONS, travel_limit_assumption(result.max_travel_hours), context.protected_stock_assumption,
             DECISION_SUPPORT_ASSUMPTION, *mapping_assumptions,
@@ -1116,10 +1123,15 @@ def run_simulation(
     request: SimulationRequest,
     config: RiskConfig = DEFAULT_RISK_CONFIG,
     max_travel_hours: float = DEFAULT_MAX_TRAVEL_HOURS,
+    donor_evidence: Callable[[SimulationResult], ReceivedStockCheckBlock] | None = None,
 ) -> SimulationResponse:
-    """POST /scenarios/simulate: evaluate a validated request against one data-store snapshot."""
+    """POST /scenarios/simulate: evaluate a validated request against one data-store snapshot.
+
+    donor_evidence adds the optimizer's received-stock donor check (the endpoint always passes it).
+    """
     transfers = [
         ProposedTransfer(item.from_facility_id, item.to_facility_id, item.medicine_id, item.quantity, item.arrival_day)
         for item in request.transfers
     ]
-    return build_simulation_response(simulate(store, transfers, request.horizon_days, config, max_travel_hours))
+    result = simulate(store, transfers, request.horizon_days, config, max_travel_hours)
+    return build_simulation_response(result, donor_evidence(result) if donor_evidence is not None else None)
