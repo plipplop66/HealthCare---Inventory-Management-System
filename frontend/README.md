@@ -10,7 +10,7 @@ The browser never calls the intelligence service and never forecasts, projects s
 
 ## Screens
 
-1. **Dashboard**: resilience score, earliest stockout, critical count and facilities monitored, with each facility's and alert's exact API risk label (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`).
+1. **Dashboard** (the API summarises insulin, the default medicine, only): resilience score, earliest stockout, critical count and facilities monitored, with each facility's and alert's exact API risk label (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`).
 2. **Facility detail**: for the selected facility and medicine, the medicine identity and unit, recorded, effective and protected stock, batches with expiry and status, demand, risk, stockout and replenishment, and the forecast's cause, confidence, explanation, model and source. The chart plots only the API's own projection; otherwise it says "Projection unavailable".
 3. **Candidates**: the donors assessed by the optimizer (from a plan, or from `NO_SAFE_PLAN` details) with every rejection code and reason, safe capacity, retained floor, travel hours, cold chain and excluded future supply. Without an assessment it asks you to run the simulator.
 4. **Ripple simulator**: submits the shared selection to `POST /api/plans/optimize`. A safe result shows the plan ID, donors, quantities, batches, routes, cold chain, risks before and after, validation checks, received-stock evidence and the human-approval requirement. `NO_SAFE_PLAN` shows capacity, unmet quantity, candidates, reasons and escalation steps. A new assessment always clears the previously selected plan.

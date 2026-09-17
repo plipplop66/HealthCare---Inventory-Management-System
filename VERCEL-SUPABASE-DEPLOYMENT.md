@@ -1,347 +1,159 @@
-# MEDRIPPLE - Vercel + Supabase Deployment Guide
+# MEDRIPPLE on Vercel and Supabase
 
-## 🎯 Overview
-This guide deploys MEDRIPPLE with:
-- **Frontend**: Vercel (already deployed)
-- **Backend API**: Vercel Serverless Functions
-- **Database**: Supabase PostgreSQL (free tier)
-- **AI Service**: Vercel Serverless Python Functions
+This guide covers setting up MEDRIPPLE on three Vercel projects and one Supabase PostgreSQL database. For a release to the existing deployment, follow [docs/release-checklist.md](docs/release-checklist.md). The current public services are listed in [docs/vercel-supabase.md](docs/vercel-supabase.md).
 
-**Cost**: 100% FREE - No payment method required!
+> **Prototype boundaries**
+> - All data is **simulated**. There is no real patient, facility, stock or supply record.
+> - Forecasts and plans are **decision support only**. No stock is reserved or moved without a **human approval** by an `APPROVER` or `ADMIN`, and every decision is audited.
+> - The dashboard (`/api/region/summary` and `/api/facilities`) currently summarises **insulin only**. Other medicines are available in facility detail and the Ripple Simulator.
+> - No patient-impact metric is calculated.
 
----
+## Architecture
 
-## 📋 Prerequisites
-- GitHub account with access to: plipplop66/HealthCare---Inventory-Management-System
-- Vercel account (you already have this)
-- Supabase account (free signup)
-
----
-
-## Step 1: Create Supabase Database (5 minutes)
-
-### 1.1 Sign up for Supabase
-1. Go to: https://supabase.com
-2. Click "Start your project"
-3. Sign in with GitHub (free tier, no credit card)
-
-### 1.2 Create a new project
-1. Click "New Project"
-2. **Organization**: Choose your org or create one
-3. **Name**: `medripple-db`
-4. **Database Password**: Create a strong password (SAVE THIS!)
-5. **Region**: Choose closest to you (e.g., `Southeast Asia (Singapore)`)
-6. Click "Create new project" (takes ~2 minutes)
-
-### 1.3 Get your connection string
-1. Once project is ready, click "Connect" (top right)
-2. Choose "Connection string" tab
-3. Select "URI" mode
-4. Copy the connection string that looks like:
-   ```
-   postgresql://postgres:[YOUR-PASSWORD]@db.xxx.supabase.co:5432/postgres
-   ```
-5. Replace `[YOUR-PASSWORD]` with your actual database password
-6. **SAVE THIS** - you'll need it for environment variables
-
-### 1.4 Run the database schema
-1. In Supabase dashboard, click "SQL Editor" (left sidebar)
-2. Click "New query"
-3. Open file: `database/schema-postgres.sql` (from this repo)
-4. Copy the ENTIRE contents and paste into the SQL editor
-5. Click "Run" (bottom right)
-6. You should see "Success. No rows returned"
-
-### 1.5 Load seed data (optional but recommended)
-1. Still in SQL Editor, create a new query
-2. Copy this modified seed data:
-
-```sql
--- Deterministic MEDRIPPLE golden flow for PostgreSQL
-DO $$
-DECLARE
-  scenario_date DATE := '2026-09-11';
-  insulin_id INT;
-  vellore_phc_id INT;
-BEGIN
-  -- Get insulin medicine ID
-  SELECT medicine_id INTO insulin_id FROM medicines
-  WHERE generic_name = 'Human Insulin' AND strength_value = 100 AND form = 'Vial'
-  LIMIT 1;
-
-  -- Get Vellore PHC facility ID
-  SELECT facility_id INTO vellore_phc_id FROM facilities 
-  WHERE facility_code = 'PHC-VLR-001' LIMIT 1;
-
-  -- Update inventory for critical scenario
-  UPDATE inventory i
-  SET quantity_on_hand = CASE
-    WHEN b.batch_number LIKE '%-B01-26' THEN 12
-    ELSE 22
-  END,
-  status = 'AVAILABLE'
-  FROM batches b
-  WHERE i.batch_id = b.batch_id
-    AND i.facility_id = vellore_phc_id
-    AND b.medicine_id = insulin_id;
-
-  -- Update replenishments to delayed
-  UPDATE replenishments
-  SET expected_arrival_date = scenario_date + INTERVAL '8 days',
-      actual_arrival_date = NULL,
-      status = 'DELAYED'
-  WHERE facility_id = vellore_phc_id
-    AND medicine_id = insulin_id
-    AND expected_arrival_date >= scenario_date;
-END $$;
+```
+Browser (frontend/, Vite build)
+  -> Express API (backend/, Vercel function)        accounts, plans, reservations, lifecycle, audit
+       -> FastAPI intelligence service (intelligence/)  forecast, simulation, optimization, approval revalidation
+       -> Supabase PostgreSQL                           the API writes; the intelligence service only reads
 ```
 
-3. Click "Run"
-4. You should see "Success"
+The browser talks only to the Express API. The intelligence service and the database are never called from the browser. With a database, simulation, optimization and approval **fail closed** (`503`) when the intelligence service is unavailable. Only forecasts fall back, and that fallback is labelled.
 
----
+## Before you start
 
-## Step 2: Deploy Backend to Vercel (3 minutes)
+- Accounts: GitHub access to this repository, Vercel and Supabase.
+- Tools: Node.js 24 and npm, Python 3.12 or later, and the PostgreSQL client tools (`psql`, and `pg_dump` for backups).
+- Secrets live only in Vercel environment settings and your password manager. Never commit them, put them in `VITE_*` variables or paste them into chat.
 
-### 2.1 Import backend repository
-1. Go to: https://vercel.com/new
-2. Click "Import Git Repository"
-3. Select: `plipplop66/HealthCare---Inventory-Management-System`
-4. Click "Import"
+## 1. Database
 
-### 2.2 Configure backend deployment
-1. **Framework Preset**: Other
-2. **Root Directory**: Click "Edit" → Select `backend`
-3. **Build Command**: `npm install`
-4. **Output Directory**: Leave empty
-5. **Install Command**: `npm install`
+Supabase's **Connect** dialog offers several connection strings:
+- **Transaction pooler** (port 6543, user `postgres.<project-ref>`): used by both applications.
+- **Session pooler** or **direct connection** (port 5432): used for `psql` and `pg_dump`.
 
-### 2.3 Add environment variables
-Click "Environment Variables" and add:
+Both applications verify TLS with the Supabase CA certificate committed in `backend/certs/` and `intelligence/certs/`. Use the same file for `psql`:
+
+```bash
+export PGSSLMODE=verify-full PGSSLROOTCERT="$PWD/backend/certs/supabase-ca.crt"
+export DB="host=<session-pooler-host> port=5432 dbname=postgres user=postgres.<project-ref>"   # no password here
+read -rsp 'Database password: ' PGPASSWORD; echo; export PGPASSWORD
+```
+
+### New database
+
+Only for an empty project. `schema-postgres.sql` **drops existing tables**.
+
+```bash
+psql "$DB" -v ON_ERROR_STOP=1 -X -f database/schema-postgres.sql
+psql "$DB" -v ON_ERROR_STOP=1 -X -f database/seed-postgres.sql
+psql "$DB" -v ON_ERROR_STOP=1 -X -f database/secure-supabase.sql
+psql "$DB" -v ON_ERROR_STOP=1 -X -f database/verify-005-postgres.sql
+```
+
+What each script does:
+- `seed-postgres.sql` loads the full final demo dataset in one transaction: 16 facilities, 12 medicines, routes, 75 days of consumption, safety stock, inventory and orders, all simulated. It uses fixed IDs (insulin is medicine `7`, batch `TN-007-B01-26` is `14`). It creates no accounts, and it refuses to run where those IDs already belong to other rows.
+- `secure-supabase.sql` enables row-level security and revokes table access from Supabase's `anon` and `authenticated` roles. Only the server-side applications read and write tables.
+- `verify-005-postgres.sql` is read-only. Its expected results are in [docs/release-checklist.md](docs/release-checklist.md#4-migration-verification).
+
+### Existing database: migration 005
+
+The deployed database was created earlier with the four-facility dataset. **Never run `schema-postgres.sql` or `seed-postgres.sql` on it.** `database/migrations/005_expand_final_demo_scenarios_postgres.sql` upgrades it to the same final demo dataset.
+- It is one transaction and insert-only. Rows are matched on natural keys and never updated or deleted, and a rerun changes nothing.
+- It never touches accounts, plans, transfers, audit events or stock changed by approvals.
+- Existing IDs are kept (insulin stays medicine `1`), so clients request insulin by the alias `med-insulin-100iu-vial`. The closing notice reports the IDs in use.
+- It has **not** been applied to the deployed database. Applying it is an owner-approved production change. Take a backup first and follow the [release checklist](docs/release-checklist.md), sections 2 to 4.
+
+```bash
+psql "$DB" -v ON_ERROR_STOP=1 -X -f database/migrations/005_expand_final_demo_scenarios_postgres.sql
+```
+
+Migrations 002-004 and `schema.sql` are **MySQL** files for the local Compose stack. `schema-postgres.sql` already contains the plan lifecycle tables they add.
+
+### Timestamps
+
+The `TIMESTAMP` columns hold UTC wall-clock time. The API writes and reads them as UTC and returns ISO-8601 instants (`...Z`), and the browser shows them in the viewer's time zone. Keep the database time zone at Supabase's default, `UTC`; `verify-005-postgres.sql` prints it.
+
+## 2. Vercel projects
+
+Create one project per directory from this repository.
+
+| Project | Root directory | Build settings |
+| --- | --- | --- |
+| Intelligence service | `intelligence` | `intelligence/vercel.json` (FastAPI, 60 s functions) |
+| Express API | `backend` | `backend/vercel.json` (`api/[...path].js` serves `/`, `/health` and `/api/*`) |
+| Frontend | `frontend` | `frontend/vercel.json` (Vite, `npm run build`, output `dist`, SPA rewrite) |
+
+### Environment variables
+
+**Intelligence service**
 
 | Name | Value |
-|------|-------|
-| `DATABASE_URL` | Your Supabase connection string from Step 1.3 |
-| `AUTH_JWT_SECRET` | Generate random 32+ chars and keep it private: `openssl rand -hex 32` |
-| `NODE_ENV` | `production` |
-| `CORS_ORIGINS` | Your deployed frontend URL (for example `https://frontend-psi-plum-56.vercel.app`) |
+| --- | --- |
+| `DATA_SOURCE` | `postgres` |
+| `DATABASE_URL` | transaction pooler URL (secret) |
+| `SIMULATION_DATE` | `2026-09-11` |
 
-> **Important**: Make sure `DATABASE_URL` is the full PostgreSQL connection string!
-
-### 2.4 Deploy
-1. Click "Deploy"
-2. Wait 2-3 minutes
-3. Copy your backend URL (e.g., `https://medripple-backend.vercel.app`)
-4. Test it: Visit `https://your-backend-url.vercel.app/health`
-   - Should return: `{"status":"ok","timestamp":"..."}`
-
----
-
-## Step 3: Deploy AI Service to Vercel (Optional - 5 minutes)
-
-The AI service requires Python. Vercel supports Python serverless functions.
-
-### 3.1 Create AI service wrapper
-The AI service needs to be adapted for Vercel's serverless format. Files are already prepared in `intelligence/api/`.
-
-### 3.2 Deploy AI service
-1. Go to: https://vercel.com/new
-2. Import same repository
-3. **Root Directory**: Click "Edit" → Select `intelligence`
-4. Add environment variables:
+**Express API**
 
 | Name | Value |
-|------|-------|
-| `DATABASE_URL` | Your Supabase connection string |
-| `ENVIRONMENT` | `production` |
+| --- | --- |
+| `DATABASE_URL` | the same transaction pooler URL (secret); it selects the PostgreSQL store |
+| `AUTH_JWT_SECRET` | unique random secret of at least 32 characters, e.g. `openssl rand -base64 48` (secret) |
+| `CORS_ORIGINS` | the exact frontend origin, e.g. `https://frontend-psi-plum-56.vercel.app` |
+| `INTELLIGENCE_SERVICE_URL` | the intelligence service URL, no trailing slash |
+| `INTELLIGENCE_TIMEOUT_MS` | `30000` |
+| `SIMULATION_DATE` | `2026-09-11` |
 
-5. Click "Deploy"
-6. Copy AI service URL (e.g., `https://medripple-ai.vercel.app`)
+`NODE_ENV=production` comes from `backend/vercel.json`. Without `AUTH_JWT_SECRET`, sign-in is refused. Without `DATABASE_URL`, the API runs on in-memory fixture data, which is only suitable for local development.
 
----
+**Frontend** (read at build time; redeploy after a change)
 
-## Step 4: Update Frontend Environment Variables (2 minutes)
+| Name | Value |
+| --- | --- |
+| `VITE_API_BASE_URL` | the Express API URL followed by `/api` |
+| `VITE_USE_MOCKS` | `false` |
 
-### 4.1 Go to your frontend Vercel project
-1. Visit: https://vercel.com/dashboard
-2. Click on your frontend project (`frontend-psi-plum-56`)
+The frontend needs nothing else. It must never receive a database URL, a secret or the intelligence service URL.
 
-### 4.2 Update environment variables
-1. Click "Settings" → "Environment Variables"
-2. Find `VITE_API_BASE_URL`
-3. Update its value to your backend URL from Step 2.4 followed by `/api` (for example, `https://medripple-backend.vercel.app/api`)
-4. If you deployed AI service, add:
-   - Name: `VITE_AI_SERVICE_URL`
-   - Value: Your AI service URL from Step 3.2
+### Deployment order
 
-### 4.3 Redeploy frontend
-1. Go to "Deployments" tab
-2. Click "..." on the latest deployment → "Redeploy"
-3. Wait 1-2 minutes
+Deploy the **intelligence service** first, then the **Express API**, then the **frontend**. The API rejects intelligence responses that lack the evidence it requires, and the frontend expects the current API.
 
----
+## 3. Accounts and roles
 
-## Step 5: Test Your Deployment (3 minutes)
+- Sign-up through the website always creates an `OPERATOR`. The API ignores any role in the request.
+- No approver account is seeded. After confirming that an account belongs to an authorised person, promote it in the Supabase SQL editor, and record who made the change:
 
-### 5.1 Test backend health
+  ```sql
+  UPDATE app_users SET role = 'APPROVER' WHERE email = '<verified email>';
+  ```
+
+- To disable an account, set `is_active = FALSE`. Sessions check the current role and status on every request.
+
+## 4. Checks
+
+Health checks:
+
 ```bash
-curl https://your-backend-url.vercel.app/health
-```
-Expected: `{"status":"ok",...}`
-
-### 5.2 Test database connection
-```bash
-curl https://your-backend-url.vercel.app/api/facilities
-```
-Expected: JSON array of facilities
-
-### 5.3 Test frontend
-1. Visit: https://frontend-psi-plum-56.vercel.app
-2. You should see the MEDRIPPLE dashboard
-3. Click "Sign Up" to create an account
-4. After signup, you should see facility data, not fixture data
-
-### 5.4 Create test user
-```bash
-curl -X POST https://your-backend-url.vercel.app/api/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{
-    "full_name": "Test Admin",
-    "email": "admin@medripple.test",
-    "password": "SecurePassword123!",
-    "role": "ADMIN"
-  }'
+curl -fsS https://<api-host>/health            # data.status "ok", data.dataSource "POSTGRES", data.database.connected true
+curl -fsS https://<intelligence-host>/health   # {"status":"ok","service":"medripple-intelligence"}
 ```
 
----
+For a release, run the read-only smoke tests in [docs/release-checklist.md](docs/release-checklist.md#8-read-only-smoke-tests). `backend/scripts/live-acceptance.js` is **not** read-only: it creates an operator account and a proposed plan. Run it against production only with approval.
 
-## 🎉 Deployment Complete!
+## Troubleshooting
 
-Your MEDRIPPLE system is now fully deployed:
+| Symptom | Check |
+| --- | --- |
+| `503 DATABASE_UNAVAILABLE` | `DATABASE_URL` (transaction pooler, correct password and URL escaping) and Supabase project status |
+| `503 INTELLIGENCE_UNAVAILABLE` or `INTELLIGENCE_TIMEOUT` | `INTELLIGENCE_SERVICE_URL`, `INTELLIGENCE_TIMEOUT_MS=30000`, and the service's `/health`. Simulation, optimization and approval fail closed by design. |
+| `401 AUTH_REQUIRED` on `/api/*` | Expected without a session; sign in first |
+| `503 AUTH_NOT_CONFIGURED` | `AUTH_JWT_SECRET` missing or shorter than 32 characters |
+| Browser CORS error or `403 CORS_ORIGIN_DENIED` | `CORS_ORIGINS` must equal the frontend origin exactly |
+| `MOCK DATA` banner in the app | The build had no `VITE_API_BASE_URL`, or had `VITE_USE_MOCKS=true`; fix it and redeploy |
+| Seed refuses to run | The database already holds other rows with the seed's IDs; use migration 005 instead |
+| Dashboard shows insulin only | Expected in this release |
 
-- ✅ **Frontend**: https://frontend-psi-plum-56.vercel.app
-- ✅ **Backend**: Your Vercel backend URL
-- ✅ **Database**: Supabase PostgreSQL (persistent)
-- ✅ **AI Service**: Your Vercel AI URL (optional)
+## Limits
 
----
-
-## 📊 What You Get (Free Tier Limits)
-
-### Vercel Free Tier
-- ✅ Unlimited deployments
-- ✅ 100 GB bandwidth/month
-- ✅ Serverless function execution
-- ✅ Automatic HTTPS
-- ✅ Global CDN
-
-### Supabase Free Tier
-- ✅ 500 MB database space
-- ✅ Unlimited API requests
-- ✅ Up to 2 GB data transfer
-- ✅ Automatic backups (7 days)
-- ✅ Connection pooling
-
----
-
-## 🔧 Troubleshooting
-
-### Backend returns 500 error
-**Cause**: Database connection issue
-**Fix**:
-1. Check `DATABASE_URL` in Vercel environment variables
-2. Make sure password is correct (no special URL characters unescaped)
-3. Test connection in Supabase SQL Editor
-
-### Frontend shows blank/fixture data
-**Cause**: `VITE_API_BASE_URL` not set correctly
-**Fix**:
-1. Go to Vercel → Frontend project → Settings → Environment Variables
-2. Update `VITE_API_BASE_URL` to your backend URL
-3. Redeploy frontend
-
-### Database schema errors
-**Cause**: PostgreSQL syntax differs from MySQL
-**Fix**: Use `database/schema-postgres.sql` (NOT `schema.sql`)
-
-### "Module not found" errors on backend
-**Cause**: Missing dependencies
-**Fix**:
-1. Check `backend/package.json` includes all dependencies
-2. Redeploy (Vercel runs `npm install` automatically)
-
----
-
-## 🔐 Security Recommendations
-
-### Before going to production:
-1. **Change default passwords**: Update JWT_SECRET
-2. **Enable Row Level Security** in Supabase:
-   ```sql
-   ALTER TABLE app_users ENABLE ROW LEVEL SECURITY;
-   -- Add policies for authenticated users only
-   ```
-3. **Add rate limiting**: Use Vercel's edge config or Upstash Redis
-4. **Enable CORS**: Restrict to your frontend domain only
-5. **Review user roles**: Audit ADMIN/APPROVER access
-
----
-
-## 📝 Environment Variables Reference
-
-### Backend (`backend/.env` or Vercel)
-```bash
-DATABASE_URL=postgresql://postgres:PASSWORD@db.xxx.supabase.co:5432/postgres
-AUTH_JWT_SECRET=your-super-secret-jwt-key-min-32-chars
-NODE_ENV=production
-CORS_ORIGINS=https://your-frontend.vercel.app
-```
-
-### Frontend (`frontend/.env.production` or Vercel)
-```bash
-VITE_API_BASE_URL=https://your-backend.vercel.app
-VITE_AI_SERVICE_URL=https://your-ai.vercel.app
-```
-
-### AI Service (`intelligence/.env` or Vercel)
-```bash
-DATABASE_URL=postgresql://postgres:PASSWORD@db.xxx.supabase.co:5432/postgres
-ENVIRONMENT=production
-```
-
----
-
-## 🚀 Next Steps
-
-1. **Custom domain** (optional): Add your own domain in Vercel settings
-2. **Monitoring**: Set up Vercel Analytics (free tier available)
-3. **Backups**: Supabase auto-backs up, but consider exporting weekly
-4. **Scale**: If you exceed free tier, upgrade Supabase (~$25/month)
-
----
-
-## 💡 Why Vercel + Supabase?
-
-| Feature | Vercel + Supabase | Railway | Render | Oracle Cloud |
-|---------|-------------------|---------|--------|--------------|
-| **Cost** | FREE forever | Trial expired | FREE with sleep | FREE (quota issues) |
-| **Setup time** | 15 min | 10 min | 15 min | 60+ min |
-| **Always-on** | ✅ Yes | ❌ Needs paid | ❌ Sleeps | ✅ Yes |
-| **Database** | PostgreSQL (Supabase) | PostgreSQL | PostgreSQL | MySQL |
-| **Auto-scaling** | ✅ Yes | ✅ Yes | ⚠️ Limited | ❌ No |
-| **Serverless** | ✅ Yes | ❌ No | ⚠️ Limited | ❌ No |
-| **No payment method** | ✅ Yes | ❌ Requires card | ❌ Requires card | ✅ Yes |
-
----
-
-## ❓ Need Help?
-
-- **Vercel Docs**: https://vercel.com/docs
-- **Supabase Docs**: https://supabase.com/docs
-- **GitHub Issues**: plipplop66/HealthCare---Inventory-Management-System/issues
-
----
-
-**Deployment Date**: 2026-09-14  
-**Version**: 1.0.0  
-**Status**: Production Ready ✅
+Free hosting tiers have usage limits and no uptime guarantee. The deployment is a simulated-data prototype for project evaluation, not a system for clinical or real medicine-transfer decisions. Actual data integration, a qualified safety-policy review, backup and restore drills, and an access review remain the owner's responsibility.

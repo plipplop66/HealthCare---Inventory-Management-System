@@ -50,9 +50,11 @@ client end its stateless session locally. The API derives the audit actor from
 the verified token, not from the request body. `APPROVER` and `ADMIN` roles can
 approve/reject plans; public sign-up can never create either role.
 
-The public Vercel fixture uses a visible simulated `APPROVER` account. Its
-in-memory registrations and audit history may reset on a serverless cold start.
-Persistent accounts require `DATA_SOURCE=mysql` and the `app_users` table.
+Without a database, the fixture store has a simulated `APPROVER` account for
+local development; its in-memory registrations and audit history reset on a
+restart. Persistent accounts need a database (PostgreSQL through `DATABASE_URL`,
+or `DATA_SOURCE=mysql`) with the `app_users` table. The PostgreSQL deployment has
+no demo account; approvers are assigned in the database after identity checks.
 
 ## Routes
 
@@ -64,9 +66,9 @@ Persistent accounts require `DATA_SOURCE=mysql` and the `app_users` table.
 | `GET` | `/api/auth/me` | Read the current signed-in account |
 | `POST` | `/api/auth/logout` | End the client-side stateless session |
 | `GET` | `/api/region/summary` | Resilience score, alerts, earliest stockout and critical-facility count for the default medicine (insulin) |
-| `GET` | `/api/facilities` | Facility coordinates, simulated risk, supply coverage, and safe surplus |
+| `GET` | `/api/facilities` | Facility coordinates, simulated risk, supply coverage, and safe surplus for the default medicine (insulin) |
 | `GET` | `/api/facilities/:facilityId/inventory?medicineId=:medicineId` | Medicine identity, batches, effective/recorded stock, consumption, and incoming supply |
-| `GET` | `/api/medicines` | Fixture medicine catalogue |
+| `GET` | `/api/medicines` | Medicine catalogue |
 | `POST` | `/api/forecast` | Forecast, risk, stockout projection, cause, confidence, and source |
 | `POST` | `/api/scenarios/simulate` | Evaluate proposed transfers and compare baseline vs intervention |
 | `POST` | `/api/plans/optimize` | Produce and persist a deterministic safe plan with scenario comparison |
@@ -75,7 +77,7 @@ Persistent accounts require `DATA_SOURCE=mysql` and the `app_users` table.
 | `POST` | `/api/plans/:planId/dispatch` | Mark a reserved plan in transit |
 | `POST` | `/api/plans/:planId/deliver` | Add the reserved batch to recipient inventory and mark delivered |
 | `POST` | `/api/plans/:planId/cancel` | Cancel a reserved plan and release donor stock |
-| `GET` | `/api/audit` | Persistent MySQL audit trail, or fixture audit history offline |
+| `GET` | `/api/audit` | Latest 100 events of the persistent database audit trail, or fixture audit history without a database |
 
 ## POST request shapes
 
@@ -219,7 +221,7 @@ donor quantity. Every action is transactional and appends an audit event.
 | 422 | `NO_SAFE_PLAN` | No safe plan exists; with the intelligence service, `details` keeps its safe capacity, candidates and escalation |
 | 4xx | Intelligence service codes | Deliberate intelligence decisions (for example `INVALID_QUANTITY_FOR_UNIT`, `MEDICINE_NOT_FOUND`) pass through unchanged |
 | 422 | `TRANSFER_PERSISTENCE_FAILED` | A decision could not be mapped to the seeded transfer records |
-| 503 | `DATABASE_UNAVAILABLE` | MySQL is not reachable or has not been seeded |
+| 503 | `DATABASE_UNAVAILABLE` | The database (PostgreSQL or MySQL) is not reachable or has not been seeded |
 | 500 | `INTERNAL_ERROR` | Unexpected server failure |
 
 ## Integration requirements

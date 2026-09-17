@@ -1,22 +1,23 @@
 # MEDRIPPLE
 
-A prototype for making regional medicine shortages visible before they become emergencies. It can run from deterministic fixtures during development or from the seeded MySQL database for the integrated backend flow.
+A prototype for making regional medicine shortages visible before they become emergencies. It runs from deterministic fixtures during development, from the seeded MySQL database in the local Docker stack, or from PostgreSQL (Supabase in the public deployment).
 
 ## What runs now
 
 The public deployment now uses **Vercel + persistent Supabase PostgreSQL**, with
 the FastAPI WMA forecast and OR-Tools CP-SAT service querying the same database.
-See [deployment status and runbook](docs/vercel-supabase.md). The database contains
-simulated repository records, not a live hospital feed. Demo passwords are not
-enabled on this deployment.
+See [deployment status](DEPLOYMENT-STATUS.md) and the [service runbook](docs/vercel-supabase.md). The
+database contains simulated repository records, not a live hospital feed. Demo
+passwords are not enabled on this deployment.
 
 - Express API with consistent JSON success and error envelopes
 - Regional summary, facilities, inventory, forecast, simulation, safe-plan, approval and audit routes
-- Seeded MySQL schema, deterministic insulin golden scenario, and switchable fixture fallback
-- Source-aware simulator, constrained safe-plan generator, deterministic MySQL plans, and atomic reserve/dispatch/deliver/cancel audit persistence
-- FastAPI intelligence service for forecasting and ripple simulation, with a timeout-bound Node fallback
+- Seeded MySQL and PostgreSQL demo datasets with deterministic insulin scenarios, and a fixture mode for development
+- Deterministic database plans, approval revalidation before any reservation, and atomic reserve/dispatch/deliver/cancel audit persistence
+- FastAPI intelligence service for forecasting, ripple simulation, optimisation and approval revalidation; with a database, only forecasts fall back (labelled) when it is unavailable
+- React workspace: dashboard (insulin summary), facility detail, candidates, Ripple Simulator, plan review and audit trail
 - Sign-up/login, signed expiring sessions, and server-enforced operator/approver roles
-- Automated API tests and a GitHub Actions check
+- Automated API, frontend and intelligence tests and a GitHub Actions check
 
 ## Quick start
 
@@ -28,7 +29,7 @@ npm run setup
 npm run dev
 ```
 
-The API starts at `http://127.0.0.1:3001`; verify it with `GET /health`.
+The API starts at `http://127.0.0.1:3001`; verify it with `GET /health`. [QUICK-START.md](QUICK-START.md) also covers the local PostgreSQL setup.
 
 ```powershell
 npm test
@@ -83,26 +84,23 @@ stock and logs the decision; delivery alone increases recipient inventory. See
 
 For a backend process running outside Docker, use `npm run db:up`, set `DATA_SOURCE=mysql` in `.env`, and then run `npm run dev`.
 
-## Public prototype deployment
+## Public deployment
 
-The public Vercel prototype uses two standard projects from this repository: deploy `backend/` first for the fixture API, then deploy `frontend/` with `VITE_API_BASE_URL` set to that API deployment's `/api` URL. The backend project deliberately uses a Vercel serverless catch-all rather than the development `listen()` entry point. This gives the public React UI real authenticated API calls without hard-coded localhost URLs.
+The public deployment runs the frontend, the Express API and the intelligence service as three Vercel projects on a persistent Supabase PostgreSQL database. The backend project uses a Vercel serverless catch-all rather than the development `listen()` entry point. With `DATABASE_URL` set, the API uses PostgreSQL; without it, it serves in-memory fixture data, which is for development only.
 
-Set a unique `AUTH_JWT_SECRET` in the backend Vercel project before deploying.
-The Vercel service defaults to deterministic fixture data. It can use an
-externally reachable managed MySQL database and FastAPI service only when its
-protected environment explicitly sets `DATA_SOURCE=mysql`, database settings,
-and `INTELLIGENCE_SERVICE_URL`. Without those persistent services, new public
-registrations and approval history live only for a warm serverless instance.
-It is a public prototype, not a persistent clinical production system.
+- Setup: [VERCEL-SUPABASE-DEPLOYMENT.md](VERCEL-SUPABASE-DEPLOYMENT.md)
+- Releases (backup, migration 005, deployment order, smoke tests, rollback): [docs/release-checklist.md](docs/release-checklist.md)
+- A Docker host with MySQL instead: [docs/deployment.md](docs/deployment.md)
 
-The MySQL-backed intelligence flow and persistent accounts need the Docker stack or another persistent Node/MySQL/FastAPI host. See [docs/deployment.md](docs/deployment.md) for the production cutover checklist. Do not label the Vercel fixture deployment as a clinical system.
+It is a simulated-data prototype, not a clinical production system.
 
 ## Important prototype boundaries
 
-All data is simulated. Forecasts and plans are decision support, not clinical advice or autonomous transfer instructions. The backend validates exact medicine identity, route cold-chain capability, protected stock over the selected horizon, and human approval/audit data. Before release, have Aaryan validate the final safety wording, equity rules, and acceptance cases.
+All data is simulated. Forecasts and plans are decision support, not clinical advice or autonomous transfer instructions; stock is reserved or moved only after a human approval by an `APPROVER` or `ADMIN`, and every decision is audited. The backend validates exact medicine identity, route cold-chain capability, protected stock over the selected horizon, and human approval/audit data. The dashboard currently summarises insulin only, and no patient-impact metric is calculated. Before release, have Aaryan validate the final safety wording, equity rules, and acceptance cases.
 
 ## Team handoffs
 
 - API contract: [docs/api-contract.md](docs/api-contract.md)
+- Deployment status and release checklist: [DEPLOYMENT-STATUS.md](DEPLOYMENT-STATUS.md), [docs/release-checklist.md](docs/release-checklist.md)
 - Sahil's task board: [docs/sahil-work.md](docs/sahil-work.md)
 - Integration notes: [docs/integration-handoffs.md](docs/integration-handoffs.md)

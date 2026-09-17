@@ -1,26 +1,14 @@
 # MEDRIPPLE deployment and release checklist
 
-## Public prototype
+## Public deployment (Vercel and Supabase)
 
-The repository ships a public Vercel prototype with the React frontend and the
-fixture-mode Express API. It exercises sign-up/login, protected data requests,
-role-aware plan review, simulation, and the audit flow against synthetic data.
-
-Set these backend Vercel environment variables before deployment:
-
-```dotenv
-AUTH_JWT_SECRET=<unique 48-byte base64url secret>
-AUTH_TOKEN_TTL_MINUTES=480
-CORS_ORIGINS=https://frontend-psi-plum-56.vercel.app
-```
-
-The Vercel entry point defaults to `DATA_SOURCE=fixture`. It uses managed
-services only when its protected environment explicitly provides
-`DATA_SOURCE=mysql`, `DATABASE_HOST`, database credentials, and
-`INTELLIGENCE_SERVICE_URL`. Without those services it has no patient data, no
-live hospital integration, and no durable user or audit storage across
-serverless cold starts. The visible Demo Approver account is intended only for
-the public synthetic-data review.
+The public deployment uses Vercel for the frontend, the Express API and the
+intelligence service, and Supabase PostgreSQL for persistent storage. Set it up
+with [VERCEL-SUPABASE-DEPLOYMENT.md](../VERCEL-SUPABASE-DEPLOYMENT.md), and release to
+it with [release-checklist.md](release-checklist.md). The Vercel API entry point uses
+PostgreSQL when `DATABASE_URL` is set; without it, the API serves in-memory
+fixture data with no durable accounts or audit history, for development only.
+No demo approver exists on the PostgreSQL deployment.
 
 ## Persistent integrated deployment
 
@@ -85,7 +73,7 @@ Run-to-Cloud-SQL connection model.
 - Public registration grants `OPERATOR` only; it cannot grant approval rights.
 - Confirm Aaryan's clinical wording and safety policy before any non-simulated
   use.
-- Run a fresh-machine `pnpm install`, `pnpm stack:up`, and golden-flow check
+- Run a fresh-machine `npm run setup`, `npm run stack:up`, and golden-flow check
   before final demonstration.
 - Production uses MySQL 8.4, which enforces the non-negative inventory CHECK
   constraint. Do not deploy to an older MySQL version that ignores CHECKs.

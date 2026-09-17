@@ -40,8 +40,11 @@ The seed is deterministic. To reset, stop the Compose stack, remove its `mysql_d
 | `seed-postgres.sql` | Fresh install: the full demo dataset with fixed IDs. One transaction; a rerun changes nothing. |
 | `migrations/005_expand_final_demo_scenarios_postgres.sql` | Upgrades an existing database to the same dataset. Insert-only, one transaction, safe to rerun. |
 | `secure-supabase.sql` | Enables row-level security and revokes browser-role access (Supabase). |
+| `verify-005-postgres.sql` | Read-only checks before and after migration 005. |
 
-Neither data script touches accounts, plans, transfers or audit events, and neither updates, deletes or truncates anything. None of this was applied to the deployed Supabase database. Running migration 005 there is a separate decision for the database owner.
+Neither data script touches accounts, plans, transfers or audit events, and neither updates, deletes or truncates anything. None of this was applied to the deployed Supabase database. Running migration 005 there is a separate decision for the database owner; [docs/release-checklist.md](../docs/release-checklist.md) covers the backup, the migration, its verification and rollback.
+
+`verify-005-postgres.sql` is a read-only check to run before and after migration 005: it runs in a `READ ONLY` transaction and reports the time zone, row counts, digests of rows the migration must not change, the added facilities, routes and IDs, and the scenario stock. The PostgreSQL `TIMESTAMP` columns hold UTC time.
 
 ### Fresh install (local)
 
