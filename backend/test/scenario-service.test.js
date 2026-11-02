@@ -39,7 +39,7 @@ test('optimizer returns a safe plan that removes the PHC stockout during the sel
   assert.equal(plan.simulation.comparison.safeToRecommend, true);
 });
 
-test('optimizer canonicalizes a database medicine alias before building persisted transfers', async () => {
+test('local simulator and optimizer refuse database stores so they can never decide database safety', async () => {
   const profiles = [
     {
       facilityId: 'WH-001', facilityName: 'Warehouse', medicineId: '7',
@@ -69,10 +69,13 @@ test('optimizer canonicalizes a database medicine alias before building persiste
       return { batchId: 99, batchNo: 'INS-99' };
     }
   };
-  const plan = await optimisePlan({
-    destinationFacilityId: 'PHC-001', medicineId: 'med-insulin-100iu-vial', quantity: 40, horizonDays: 7
-  }, databaseStore, createPlanStore());
-
-  assert.equal(plan.transfers[0].medicineId, '7');
-  assert.equal(plan.transfers[0].batchId, 99);
+  for (const source of ['MYSQL', 'POSTGRES', undefined]) {
+    const store = { ...databaseStore, source };
+    await assert.rejects(optimisePlan({
+      destinationFacilityId: 'PHC-001', medicineId: 'med-insulin-100iu-vial', quantity: 40, horizonDays: 7
+    }, store, createPlanStore()), { status: 503, code: 'INTELLIGENCE_UNAVAILABLE' });
+    await assert.rejects(simulateScenario({
+      horizonDays: 7, transfers: [{ fromFacilityId: 'WH-001', toFacilityId: 'PHC-001', medicineId: '7', quantity: 40, arrivalDay: 1 }]
+    }, store), { status: 503, code: 'INTELLIGENCE_UNAVAILABLE' });
+  }
 });

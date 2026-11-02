@@ -8,7 +8,8 @@ const { createAuthStore } = require('./auth-store');
 const { createIntelligenceAdapter } = require('./intelligence-adapter');
 const { createInventoryStore } = require('./inventory-store');
 
-function createApp(config) {
+// dependencies lets tests supply stores (for example with a private, closable database pool).
+function createApp(config, dependencies = {}) {
   const app = express();
   const authConfig = {
     ...config,
@@ -16,8 +17,8 @@ function createApp(config) {
     authTokenTtlMinutes: config.authTokenTtlMinutes || 8 * 60
   };
   const allowedOrigins = new Set(config.corsOrigins);
-  const inventoryStore = createInventoryStore(config);
-  const authStore = createAuthStore(config);
+  const inventoryStore = dependencies.inventoryStore || createInventoryStore(config);
+  const authStore = dependencies.authStore || createAuthStore(config);
   const authService = createAuthService(authConfig, authStore);
 
   app.disable('x-powered-by');

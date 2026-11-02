@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const { test } = require('node:test');
 const { createIntelligenceAdapter } = require('../src/intelligence-adapter');
+const { VELLORE_PLAN_ID, planResponse, simulationResponse, startFakeIntelligence } = require('./support/intelligence-fixtures');
 
 test('NO_SAFE_PLAN preserves capacity and escalation details without a fallback', async (t) => {
   const details = { requestedQuantity: 45, safeCapacity: 14.3, unmetQuantity: 30.7, unit: 'mL', recommendedEscalation: ['Review replenishment.'] };
@@ -47,52 +48,81 @@ test('database mode fallback forecasts against active database profiles', async 
 });
 
 test('uses the intelligence service for a compatible ripple simulation', async (t) => {
-  const requests = [];
-  const server = http.createServer((request, response) => {
-    let body = '';
-    request.on('data', (chunk) => { body += chunk; });
-    request.on('end', () => {
-      requests.push({ url: request.url, body: JSON.parse(body) });
-      response.writeHead(200, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({
-        baseline: { facilities: [] },
-        intervention: { facilities: [] },
-        transferEvaluations: [],
-        comparison: { safeToRecommend: true }
-      }));
-    });
-  });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise((resolve) => server.close(resolve)));
-  const { port } = server.address();
-  const adapter = createIntelligenceAdapter({ intelligenceServiceUrl: `http://127.0.0.1:${port}`, intelligenceTimeoutMs: 1000 }, {});
+  const input = { horizonDays: 14, transfers: [{ fromFacilityId: 'WH-TN-001', toFacilityId: 'PHC-VLR-001', medicineId: '7', quantity: 300, arrivalDay: 1 }] };
+  const service = await startFakeIntelligence(t, ({ body }) => ({ body: simulationResponse(body) }));
+  const adapter = createIntelligenceAdapter({ intelligenceServiceUrl: service.url, intelligenceTimeoutMs: 1000 }, {});
 
-  const scenario = await adapter.simulate({ horizonDays: 14, transfers: [] });
+  const scenario = await adapter.simulate(input);
 
   assert.equal(scenario.source, 'INTELLIGENCE_SERVICE');
   assert.equal(scenario.comparison.safeToRecommend, true);
-  assert.deepEqual(requests, [{ url: '/scenarios/simulate', body: { horizonDays: 14, transfers: [] } }]);
+  assert.deepEqual(service.requests, [{ url: '/scenarios/simulate', body: input }]);
+});
+
+test('service failures map to timeout, unavailable and invalid-response errors; decisions pass through', async (t) => {
+  const request = { horizonDays: 14, transfers: [{ fromFacilityId: 'WH-TN-001', toFacilityId: 'PHC-VLR-001', medicineId: '7', quantity: 300, arrivalDay: 1 }] };
+  const stopped = http.createServer();
+  await new Promise((resolve) => stopped.listen(0, '127.0.0.1', resolve));
+  const stoppedUrl = `http://127.0.0.1:${stopped.address().port}`;
+  await new Promise((resolve) => stopped.close(resolve));
+  const cases = [
+    [() => 'HANG', { status: 503, code: 'INTELLIGENCE_TIMEOUT' }],
+    [null, { status: 503, code: 'INTELLIGENCE_UNAVAILABLE' }],
+    [() => ({ status: 503, body: { error: { code: 'DATABASE_UNAVAILABLE', message: 'db down' } } }), { status: 503, code: 'INTELLIGENCE_UNAVAILABLE' }],
+    [() => ({ body: '<html>' }), { status: 503, code: 'INVALID_INTELLIGENCE_RESPONSE' }],
+    [() => ({ status: 405, body: '' }), { status: 503, code: 'INVALID_INTELLIGENCE_RESPONSE' }],
+    [() => ({ status: 422, body: { error: { code: 'INVALID_REQUEST', message: 'Bad transfer.', details: { index: 0 } } } }), { status: 422, code: 'INVALID_REQUEST' }]
+  ];
+  for (const [handler, expected] of cases) {
+    const url = handler ? (await startFakeIntelligence(t, handler)).url : stoppedUrl;
+    const adapter = createIntelligenceAdapter({ intelligenceServiceUrl: url, intelligenceTimeoutMs: 200 }, {});
+    for (const run of [() => adapter.simulate(request), () => adapter.revalidatePlan(request), () => adapter.optimize({ destinationFacilityId: 'PHC-VLR-001', medicineId: '7', quantity: 300, horizonDays: 14 })]) {
+      await assert.rejects(run(), (error) => {
+        assert.deepEqual({ status: error.status, code: error.code }, expected);
+        if (expected.code === 'INVALID_REQUEST') assert.deepEqual(error.details, { index: 0 });
+        assert.doesNotMatch(error.message, /db down|<html>/);
+        return true;
+      });
+    }
+  }
+});
+
+test('plan revalidation requires route, batch and received-stock evidence', async (t) => {
+  const request = {
+    horizonDays: 14,
+    transfers: [{ fromFacilityId: 'WH-TN-001', toFacilityId: 'PHC-VLR-001', medicineId: '7', quantity: 300, batchId: 14, batchNo: 'TN-007-B01-26', departureDay: 1, arrivalDay: 1 }]
+  };
+  const removals = [
+    (response) => { delete response.receivedStockCheck; },
+    (response) => { response.receivedStockCheck.donors[0].passed = 'true'; },
+    (response) => { delete response.maxTravelHours; },
+    (response) => { delete response.modelVersion; },
+    (response) => { delete response.dataContext; },
+    (response) => { delete response.medicine.requiresColdChain; },
+    (response) => { delete response.transferEvaluations[0].route; },
+    (response) => { response.transferEvaluations[0].route = { distanceKm: 1 }; },
+    (response) => { delete response.transferEvaluations[0].batches[0].batchId; },
+    (response) => { response.transferEvaluations[0].index = 1; }
+  ];
+  for (const remove of removals) {
+    const service = await startFakeIntelligence(t, ({ body }) => { const response = simulationResponse(body); remove(response); return { body: response }; });
+    const adapter = createIntelligenceAdapter({ intelligenceServiceUrl: service.url, intelligenceTimeoutMs: 1000 }, {});
+    await assert.rejects(adapter.revalidatePlan(request), { status: 503, code: 'INVALID_INTELLIGENCE_RESPONSE' });
+  }
+  const service = await startFakeIntelligence(t, ({ body }) => ({ body: simulationResponse(body) }));
+  const adapter = createIntelligenceAdapter({ intelligenceServiceUrl: service.url, intelligenceTimeoutMs: 1000 }, {});
+  const accepted = await adapter.revalidatePlan(request);
+  assert.equal(accepted.source, 'INTELLIGENCE_SERVICE');
+  assert.deepEqual(service.requests[0].body, request);
 });
 
 test('uses the intelligence optimizer plan without discarding batch persistence data', async (t) => {
-  const server = http.createServer((request, response) => {
-    response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({
-      id: 'plan-ai-001', status: 'PROPOSED', medicine: { id: '7' },
-      transfers: [{ fromFacilityId: 'WH-001', toFacilityId: 'PHC-001', medicineId: '7', batchId: 99, quantity: 40 }],
-      simulation: {
-        baseline: { facilities: [] }, intervention: { facilities: [] }, transferEvaluations: [],
-        comparison: { safeToRecommend: true }
-      }
-    }));
-  });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise((resolve) => server.close(resolve)));
-  const { port } = server.address();
-  const adapter = createIntelligenceAdapter({ intelligenceServiceUrl: `http://127.0.0.1:${port}`, intelligenceTimeoutMs: 1000 }, {});
+  const service = await startFakeIntelligence(t, () => ({ body: planResponse() }));
+  const adapter = createIntelligenceAdapter({ intelligenceServiceUrl: service.url, intelligenceTimeoutMs: 1000 }, {});
 
-  const plan = await adapter.optimize({ destinationFacilityId: 'PHC-001', medicineId: '7', quantity: 40, horizonDays: 7 });
+  const plan = await adapter.optimize({ destinationFacilityId: 'PHC-VLR-001', medicineId: '7', quantity: 300, horizonDays: 14 });
 
   assert.equal(plan.source, 'INTELLIGENCE_SERVICE');
-  assert.equal(plan.transfers[0].batchId, 99);
+  assert.equal(plan.id, VELLORE_PLAN_ID);
+  assert.deepEqual(plan.transfers.map((transfer) => [transfer.batchId, transfer.batchNo]), [[14, 'TN-007-B01-26']]);
 });

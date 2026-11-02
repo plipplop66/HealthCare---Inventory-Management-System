@@ -181,7 +181,7 @@ class DataMappingBlock(ApiModel):
     name: str
     source: str
     rule: str
-    status: Literal["PROVISIONAL", "DATABASE_POLICY"]
+    status: Literal["PROVISIONAL", "DATABASE_POLICY", "APPROVED_FOR_HACKATHON_PROTOTYPE"]
     review_owner: str
 
 
@@ -353,6 +353,7 @@ class RouteBlock(ApiModel):
 
 
 class BatchAllocationBlock(ApiModel):
+    batch_id: int | None = Field(default=None, description="batches.batch_id; null for the fixture, which only has batch numbers.")
     batch_no: str
     quantity: float
     expiry_date: dt.date
@@ -443,6 +444,30 @@ class SimulationDataContextBlock(ApiModel):
     notes: list[str]
 
 
+class ReceivedStockDonorBlock(ApiModel):
+    facility_id: str
+    facility_name: str
+    total_sent: float
+    retained_floor: float = Field(description="Protected stock plus the equity or operational reserve, as the optimizer applies it.")
+    lowest_projected_stock: float = Field(description="Lowest closing stock from the first departure day, counting only stock already received.")
+    lowest_projected_day: int
+    future_replenishment_excluded: float = Field(description="Scheduled or delayed stock due within the horizon that this check does not count.")
+    passed: bool
+    failure_codes: list[str] = Field(
+        description="WITHDRAWAL_EXCEEDS_RECEIVED_STOCK, BELOW_RETAINED_FLOOR, SAFETY_STOCK_NOT_RECORDED, DONOR_AT_RISK or DONOR_DATA_UNAVAILABLE; empty when passed."
+    )
+    explanation: str
+
+
+class ReceivedStockCheckBlock(ApiModel):
+    """Donor safety counting only stock already received: evidence alongside, not part of, transfer eligibility."""
+
+    basis: Literal["RECEIVED_STOCK_ONLY"]
+    passed: bool = Field(description="True only when at least one transfer was applied and every donor passes.")
+    donors: list[ReceivedStockDonorBlock]
+    explanation: str
+
+
 class SimulationResponse(ApiModel):
     scenario_type: Literal["SIMULATED_FIXTURE", "SIMULATED_DATABASE"]
     horizon_days: int
@@ -452,6 +477,12 @@ class SimulationResponse(ApiModel):
     intervention: RegionalStateBlock
     transfer_evaluations: list[TransferEvaluationBlock]
     comparison: SimulationComparisonBlock
+    max_travel_hours: float = Field(description="The route limit applied; a longer route is ineligible (TRAVEL_TIME_LIMIT_EXCEEDED).")
+    received_stock_check: ReceivedStockCheckBlock | None = Field(
+        default=None,
+        description="Donor safety counting only stock already received. It does not change eligibility or safeToRecommend; "
+        "the Node backend requires it to pass before reserving stock.",
+    )
     assumptions: list[str]
     limitations: list[str]
     decision_support_only: Literal[True] = True
@@ -559,6 +590,9 @@ class CandidateBlock(ApiModel):
     operational_reserve: float | None = Field(description="Storage facilities only: share of effective stock kept for regional supply.")
     retained_floor: float | None = Field(description="Stock the donor must keep on every day from departure to the end of the horizon.")
     lasting_batch_quantity: float = Field(description="Usable stock in batches that stay in date until the end of the horizon.")
+    future_replenishment_excluded: float = Field(
+        description="Scheduled or delayed stock due within the horizon that is deliberately not counted toward donor capacity."
+    )
     safe_capacity: float
     allocated_quantity: float
     baseline_risk_score: int | None
@@ -570,14 +604,21 @@ class CandidateBlock(ApiModel):
 
 
 class EquityGuardrailBlock(ApiModel):
+    """The donor guardrails in effect (OptimizerConfig), so a client can explain every donor rejection."""
+
     formula: str
     remoteness_weight: float
     facility_type_uplift: dict[str, float]
     default_type_uplift: float
     warehouse_operational_reserve_share: float
     excluded_donor_risk_labels: list[str]
-    status: Literal["PROVISIONAL"]
+    max_travel_hours: float = Field(description="Longest donor route allowed; a longer route is rejected with TRAVEL_TIME_LIMIT_EXCEEDED.")
+    donor_capacity_basis: Literal["RECEIVED_STOCK_ONLY"] = Field(
+        description="Donor capacity counts only stock already received; scheduled, delayed and other future deliveries never add to it."
+    )
+    status: Literal["APPROVED_FOR_HACKATHON_PROTOTYPE"]
     review_owner: str
+    validation_note: str
 
 
 class ValidationCheckBlock(ApiModel):
@@ -652,6 +693,7 @@ class NoSafePlanDetailsBlock(ApiModel):
     rejected_candidates: list[CandidateBlock]
     recommended_escalation: list[str]
     explanation: str
+    equity_guardrail: EquityGuardrailBlock = Field(description="The donor guardrails that were applied, including the travel-time limit.")
     decision_support_only: Literal[True] = True
     data_context: SimulationDataContextBlock
 

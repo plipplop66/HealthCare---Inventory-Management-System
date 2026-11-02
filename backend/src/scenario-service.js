@@ -1,5 +1,19 @@
 const { AppError } = require('./errors');
 
+const FIXTURE_SOURCES = new Set(['FIXTURE_STORE', 'MEMORY']);
+
+function isFixtureSource(source) {
+  return FIXTURE_SOURCES.has(source);
+}
+
+// These local rules are a labelled development fallback for the fixture. They never decide safety for a database.
+function assertFixtureStore(inventoryStore) {
+  if (!isFixtureSource(inventoryStore?.source)) {
+    throw new AppError(503, 'INTELLIGENCE_UNAVAILABLE',
+      'Database scenarios and plans require the intelligence service; the local fixture rules are not used. Nothing was saved.');
+  }
+}
+
 function riskForDays(daysRemaining) {
   if (daysRemaining <= 3) return { label: 'CRITICAL', score: 92 };
   if (daysRemaining <= 7) return { label: 'HIGH', score: 72 };
@@ -30,7 +44,6 @@ function simulateCoverage(profile, horizonDays, transferArrivals = []) {
   let stock = Number(profile.effectiveStock);
   let stockoutDay = null;
   let shortageDays = 0;
-  let patientDaysAtRisk = 0;
   const dailyDemand = Number(profile.dailyDemand);
   const arrivals = new Map();
   for (const arrival of transferArrivals) {
@@ -46,7 +59,6 @@ function simulateCoverage(profile, horizonDays, transferArrivals = []) {
     if (stock < 0) {
       if (stockoutDay === null) stockoutDay = day;
       shortageDays += 1;
-      patientDaysAtRisk += Math.ceil(Math.abs(stock) / Math.max(dailyDemand, 1));
       stock = 0;
     }
   }
@@ -56,7 +68,6 @@ function simulateCoverage(profile, horizonDays, transferArrivals = []) {
     endingStock: Number(stock.toFixed(2)),
     stockoutDay,
     shortageDays,
-    patientDaysAtRisk,
     plannedArrivals: [...arrivals.entries()]
       .map(([day, quantity]) => ({ day, quantity }))
       .sort((left, right) => left.day - right.day)
@@ -90,6 +101,7 @@ async function evaluateTransfer(transfer, horizonDays, inventoryStore) {
 }
 
 async function simulateScenario({ transfers, horizonDays }, inventoryStore) {
+  assertFixtureStore(inventoryStore);
   const medicineIds = [...new Set(transfers.map((transfer) => transfer.medicineId))];
   if (medicineIds.length !== 1) {
     throw new AppError(400, 'MULTI_MEDICINE_SCENARIO_UNSUPPORTED', 'A scenario may contain transfers for one exact medicine identity at a time.');
@@ -130,8 +142,6 @@ async function simulateScenario({ transfers, horizonDays }, inventoryStore) {
       criticalFacilityDelta: afterCritical - beforeCritical,
       shortageDayDelta: after.reduce((total, facility) => total + facility.shortageDays, 0)
         - before.reduce((total, facility) => total + facility.shortageDays, 0),
-      patientDaysAtRiskDelta: after.reduce((total, facility) => total + facility.patientDaysAtRisk, 0)
-        - before.reduce((total, facility) => total + facility.patientDaysAtRisk, 0),
       newRisks,
       safeToRecommend: evaluations.every((item) => item.eligible) && newRisks.length === 0
     },
@@ -139,7 +149,8 @@ async function simulateScenario({ transfers, horizonDays }, inventoryStore) {
   };
 }
 
-async function optimisePlan(input, inventoryStore, planStore, runSimulation = (scenario) => simulateScenario(scenario, inventoryStore)) {
+async function optimisePlan(input, inventoryStore, planStore, runSimulation = (scenario) => simulateScenario(scenario, inventoryStore), labels = {}) {
+  assertFixtureStore(inventoryStore);
   const destination = await inventoryStore.getScenarioProfile(input.destinationFacilityId, input.medicineId);
   if (!destination) {
     throw new AppError(404, 'OPTIMIZATION_TARGET_NOT_FOUND', 'The requested facility or medicine was not found.');
@@ -188,8 +199,9 @@ async function optimisePlan(input, inventoryStore, planStore, runSimulation = (s
     transfers,
     simulation,
     rationale: 'The plan uses eligible donors while preserving each donor\'s protected stock.',
-    assumptions: ['Simulated data only.', 'Exact medicine identity is enforced.', 'A human must approve before any transfer action.']
+    assumptions: ['Simulated data only.', 'Exact medicine identity is enforced.', 'A human must approve before any transfer action.'],
+    ...labels
   });
 }
 
-module.exports = { simulateScenario, optimisePlan, projectProfile, simulateCoverage };
+module.exports = { simulateScenario, optimisePlan, projectProfile, simulateCoverage, isFixtureSource };

@@ -67,6 +67,10 @@ def test_vellore_receives_a_safe_plan(vellore):
     assert (body["status"], body["medicine"]["unit"], body["dataContext"]["dataSource"]) == ("PROPOSED", "mL", "MYSQL")
     assert body["recipient"]["stockoutDayBefore"] == 1 and body["recipient"]["stockoutDayAfter"] is None
     assert body["solver"]["status"] in ("OPTIMAL", "FEASIBLE") and body["validation"]["passed"] is True
+    checks = {item["name"]: item["passed"] for item in body["validation"]["checks"]}
+    assert checks["ROUTES_WITHIN_TRAVEL_LIMIT"] is True and checks["DONORS_SAFE_WITHOUT_FUTURE_SUPPLY"] is True
+    assert all(item["travelHours"] <= body["equityGuardrail"]["maxTravelHours"] == 6.0 for item in body["transfers"])
+    assert body["requiresHumanApproval"] is True and body["simulation"]["comparison"]["newShortagesCreated"] == []
 
 
 def test_plan_uses_existing_usable_database_batches(vellore, settings):
@@ -121,10 +125,49 @@ def test_impossible_requests_return_no_safe_plan(client):
     assert (no_cold_chain.status_code, no_cold_chain.json()["error"]["details"]["safeCapacity"]) == (422, 0.0)
 
 
-@pytest.mark.parametrize("destination, medicine, quantity, unit", [("SC-RMD-001", "10", 12, "count"), ("CHC-TRY-001", "1", 1000.5, "mg")])
-def test_other_medicines_and_units_can_be_optimized(client, destination, medicine, quantity, unit):
-    response = client.post("/plans/optimize", json={"destinationFacilityId": destination, "medicineId": medicine, "quantity": quantity, "horizonDays": 14})
+@pytest.mark.parametrize("medicine, quantity, unit", [("10", 12, "count"), ("1", 1000.5, "mg")])
+def test_other_medicines_and_units_can_be_optimized(client, medicine, quantity, unit):
+    response = client.post("/plans/optimize", json={"destinationFacilityId": "PHC-VLR-001", "medicineId": medicine, "quantity": quantity, "horizonDays": 14})
     assert response.status_code == 200, response.text
     body = response.json()
     assert (body["unit"], body["medicine"]["id"], body["allocatedQuantity"]) == (unit, medicine, float(quantity))
     assert body["simulation"]["comparison"]["safeToRecommend"] is True
+
+
+def candidates_of(response):
+    body = response.json()
+    if response.status_code == 200:
+        return body["candidates"]
+    info = body["error"]["details"]
+    return info["eligibleCandidates"] + info["rejectedCandidates"]
+
+
+@pytest.mark.parametrize("destination, medicine", [("PHC-VLR-001", "7"), ("SC-RMD-001", "10"), ("CHC-TRY-001", "1")])
+def test_every_route_over_the_travel_limit_is_rejected(client, destination, medicine):
+    response = client.post("/plans/optimize", json={"destinationFacilityId": destination, "medicineId": medicine, "quantity": 1, "horizonDays": 14})
+    assert response.status_code in (200, 422), response.text
+    routed = [item for item in candidates_of(response) if item["travelHours"] is not None]
+    assert any(item["travelHours"] > 6 for item in routed)
+    for item in routed:
+        assert ("TRAVEL_TIME_LIMIT_EXCEEDED" in item["rejectionCodes"]) == (item["travelHours"] > 6), item
+    for transfer in response.json().get("transfers", []):
+        assert transfer["travelHours"] <= 6
+
+
+def test_donor_future_supply_matches_the_database_and_is_not_counted(client, settings, vellore):
+    body = vellore.json()
+    horizon_end = date.fromisoformat(body["dataContext"]["asOfDate"]).toordinal() + body["horizonDays"] - 1
+    excluded = {item["facilityId"]: item["futureReplenishmentExcluded"] for item in body["candidates"] if item["futureReplenishmentExcluded"] > 0}
+    assert excluded, "the seed has scheduled or delayed deliveries for insulin donors"
+    for facility_id, quantity in excluded.items():
+        rows = query(
+            settings,
+            "SELECT r.quantity, r.expected_arrival_date FROM replenishments r JOIN facilities f ON f.facility_id = r.facility_id "
+            "WHERE f.facility_code = %s AND r.medicine_id = 7 AND r.status IN ('SCHEDULED', 'DELAYED') AND r.expected_arrival_date > %s",
+            (facility_id, body["dataContext"]["simulationDate"]),
+        )
+        expected = sum(float(amount) for amount, arrival in rows if arrival.toordinal() <= horizon_end)
+        assert round(expected, 2) == quantity, facility_id
+        candidate = next(item for item in body["candidates"] if item["facilityId"] == facility_id)
+        if candidate["status"] == "REJECTED" and "NO_SAFE_DONOR_CAPACITY" in candidate["rejectionCodes"]:
+            assert any("not counted toward donor capacity" in reason for reason in candidate["rejectionReasons"])

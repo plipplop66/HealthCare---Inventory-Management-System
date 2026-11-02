@@ -4,19 +4,33 @@ const { publicUser, requireAuthentication, requireRole } = require('./auth');
 const {
   validateForecastRequest, validateTransfers, validateOptimizeRequest, validateDecision, validateOperationalNote
 } = require('./validation');
-const { simulateScenario, optimisePlan } = require('./scenario-service');
+const { isServiceFailure } = require('./intelligence-adapter');
+const { simulateScenario, optimisePlan, isFixtureSource } = require('./scenario-service');
 const { createPlanStore } = require('./plan-store');
+const { FIXTURE_REVALIDATION, buildRevalidationRequest, revalidatePlan } = require('./plan-revalidation');
 
 function success(response, data, meta = {}) {
   response.json({ data, meta: { ...meta, requestId: response.locals.requestId } });
 }
 
+// Local rules are a development fixture fallback only and are labelled as such.
+function fixtureFallbackLabels(error) {
+  return { source: 'FIXTURE_FALLBACK', isFallback: true, fallbackReason: error.code, decisionSupportOnly: true };
+}
+
 function createApiRouter({ authService, intelligenceAdapter, inventoryStore }) {
   const router = express.Router();
   const planStore = createPlanStore();
-  const isPersistentStore = inventoryStore.source !== 'FIXTURE_STORE' && inventoryStore.source !== 'MEMORY';
-  const runScenario = async (input) => (await intelligenceAdapter.simulate(input))
-    || simulateScenario(input, inventoryStore);
+  // Database modes use the intelligence service as the only authority for simulation, optimization and approval.
+  const isPersistentStore = !isFixtureSource(inventoryStore.source);
+  const runScenario = async (input) => {
+    try {
+      return await intelligenceAdapter.simulate(input);
+    } catch (error) {
+      if (isPersistentStore || !isServiceFailure(error)) throw error;
+      return { ...(await simulateScenario(input, inventoryStore)), ...fixtureFallbackLabels(error) };
+    }
+  };
   const persistPlan = async (candidate) => {
     const inMemoryPlan = planStore.create(candidate);
     const persisted = await inventoryStore.persistPlan(inMemoryPlan);
@@ -36,23 +50,17 @@ function createApiRouter({ authService, intelligenceAdapter, inventoryStore }) {
     await Promise.all(input.transfers.map((transfer) => inventoryStore.assertQuantityPrecision(transfer.medicineId, transfer.quantity)));
   };
   const runOptimization = async (input) => {
-    const intelligencePlan = await intelligenceAdapter.optimize(input);
-    if (!intelligencePlan) {
-      if (isPersistentStore) {
-        throw new AppError(503, 'INTELLIGENCE_UNAVAILABLE', 'The safe allocation service is unavailable. No inventory-reserving plan was created; retry when the service is healthy.');
-      }
-      return persistPlan(await optimisePlan(input, inventoryStore, planStore, runScenario));
+    let intelligencePlan;
+    try {
+      intelligencePlan = await intelligenceAdapter.optimize(input);
+    } catch (error) {
+      if (isPersistentStore || !isServiceFailure(error)) throw error;
+      const labels = fixtureFallbackLabels(error);
+      const localScenario = async (scenario) => ({ ...(await simulateScenario(scenario, inventoryStore)), ...labels });
+      return persistPlan(await optimisePlan(input, inventoryStore, planStore, localScenario, labels));
     }
-    return persistPlan({
-      ...intelligencePlan,
-      medicine: intelligencePlan.medicine,
-      destinationFacilityId: intelligencePlan.destinationFacilityId,
-      horizonDays: intelligencePlan.horizonDays,
-      transfers: intelligencePlan.transfers,
-      rationale: intelligencePlan.rationale,
-      assumptions: intelligencePlan.assumptions,
-      simulation: intelligencePlan.simulation
-    });
+    // The service's plan ID, transfers, batches, candidates, validation and context are kept exactly.
+    return persistPlan(intelligencePlan);
   };
 
   router.post('/auth/signup', asyncHandler(async (request, response) => {
@@ -88,17 +96,12 @@ function createApiRouter({ authService, intelligenceAdapter, inventoryStore }) {
     const averageRisk = facilities.length
       ? facilities.reduce((total, facility) => total + facility.riskScore, 0) / facilities.length
       : 0;
-    const patientDaysAtRisk = facilities.reduce((total, facility) => {
-      const shortageBeforeWeekEnd = Math.max(0, 7 - (facility.daysRemaining || 0));
-      return total + Math.ceil(shortageBeforeWeekEnd * facility.dailyDemand);
-    }, 0);
     success(response, {
       resilienceScore: Math.max(0, Math.round(100 - averageRisk)),
       earliestStockout: sortedByCoverage[0]
         ? { facilityId: sortedByCoverage[0].facilityId, facilityName: sortedByCoverage[0].name || sortedByCoverage[0].facilityName, daysRemaining: sortedByCoverage[0].daysRemaining }
         : null,
       criticalFacilityCount: criticalFacilities.length,
-      patientDaysAtRisk,
       alerts: criticalFacilities.map((facility) => ({
         facilityId: facility.facilityId, riskLabel: facility.riskLabel, cause: 'LOW_SIMULATED_COVERAGE', daysRemaining: facility.daysRemaining
       })),
@@ -131,8 +134,9 @@ function createApiRouter({ authService, intelligenceAdapter, inventoryStore }) {
     await assertScenarioPrecision(input);
     const scenario = await runScenario(input);
     success(response, scenario, {
-      source: scenario.source || inventoryStore.source,
-      fallback: scenario.source !== 'INTELLIGENCE_SERVICE'
+      source: scenario.source,
+      fallback: scenario.source !== 'INTELLIGENCE_SERVICE',
+      decisionSupportOnly: true
     });
   }));
 
@@ -141,8 +145,8 @@ function createApiRouter({ authService, intelligenceAdapter, inventoryStore }) {
     await inventoryStore.assertQuantityPrecision(input.medicineId, input.quantity);
     const plan = await runOptimization(input);
     success(response, plan, {
-      source: plan.source || plan.simulation?.source || inventoryStore.source,
-      fallback: (plan.source || plan.simulation?.source) !== 'INTELLIGENCE_SERVICE',
+      source: plan.source,
+      fallback: plan.source !== 'INTELLIGENCE_SERVICE',
       decisionSupportOnly: true
     });
   }));
@@ -153,13 +157,29 @@ function createApiRouter({ authService, intelligenceAdapter, inventoryStore }) {
     success(response, plan, { source: inventoryStore.source });
   }));
 
+  // Approval order: authenticated approver, exact stored plan, PROPOSED, then (for APPROVE) the plan's exact transfers
+  // are revalidated by the intelligence service, and only then does the database transaction reserve stock.
   router.post('/plans/:planId/approve', requireRole('APPROVER', 'ADMIN'), asyncHandler(async (request, response) => {
     const decision = validateDecision(request.body);
     const plan = await loadPlan(request.params.planId);
     if (!plan) throw new AppError(404, 'PLAN_NOT_FOUND', 'The requested plan was not found.');
+    if (plan.status !== 'PROPOSED') {
+      throw new AppError(409, 'PLAN_ALREADY_DECIDED', 'Only a proposed plan can be approved or rejected.', { planId: plan.id, status: plan.status });
+    }
     const actor = `${request.user.name} <${request.user.email}>`;
-    const result = await planStore.decide(request.params.planId, { ...decision, actor }, inventoryStore);
-    success(response, result, { source: inventoryStore.source, decisionSupportOnly: true });
+    let revalidation;
+    let expectedDonorStock;
+    if (decision.decision === 'APPROVE') {
+      if (isPersistentStore) {
+        const revalidationRequest = buildRevalidationRequest(plan);
+        expectedDonorStock = await inventoryStore.readDonorStock(plan);
+        revalidation = await revalidatePlan(plan, revalidationRequest, intelligenceAdapter, inventoryStore.source);
+      } else {
+        revalidation = FIXTURE_REVALIDATION;
+      }
+    }
+    const result = await planStore.decide(plan.id, { ...decision, actor, revalidation, expectedDonorStock }, inventoryStore);
+    success(response, { ...result, ...(revalidation ? { revalidation } : {}) }, { source: inventoryStore.source, decisionSupportOnly: true });
   }));
 
   for (const [path, action] of [['dispatch', 'DISPATCH'], ['deliver', 'DELIVER'], ['cancel', 'CANCEL']]) {

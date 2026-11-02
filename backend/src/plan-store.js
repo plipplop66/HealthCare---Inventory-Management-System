@@ -59,7 +59,9 @@ function createPlanStore() {
     get(planId) {
       return plans.get(planId) || null;
     },
-    async decide(planId, { decision, actor, note }, inventoryStore) {
+    // revalidation is the approval-time safety summary kept in the audit record; expectedDonorStock is the donor
+    // inventory read before revalidation, which the database transaction requires to be unchanged.
+    async decide(planId, { decision, actor, note, revalidation, expectedDonorStock }, inventoryStore) {
       const plan = plans.get(planId);
       if (!plan) throw new AppError(404, 'PLAN_NOT_FOUND', 'The requested plan was not found.');
       if (plan.status !== 'PROPOSED') {
@@ -70,14 +72,15 @@ function createPlanStore() {
         ? (['MYSQL', 'POSTGRES'].includes(inventoryStore.source) ? 'RESERVED' : 'APPROVED')
         : 'REJECTED';
       const beforeState = { status: plan.status, transfers: plan.transfers };
-      const afterState = { status: afterStatus, transfers: plan.transfers };
+      const afterState = { status: afterStatus, transfers: plan.transfers, ...(revalidation ? { revalidation } : {}) };
       const persistence = await inventoryStore.recordPlanDecision({
         plan,
         decision,
         actor,
         note,
         beforeState,
-        afterState
+        afterState,
+        expectedDonorStock
       });
       const audit = {
         id: persistence.auditId || `audit-${audits.length + 1}`,

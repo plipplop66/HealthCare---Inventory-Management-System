@@ -7,17 +7,22 @@ proposes the smallest safe redistribution plan from one or more donors:
    (load_facility_state and baseline_outcome in app/simulator.py, which reuse the POST /forecast engine).
 2. Filter candidates with hard rules. Identity, data, route, cold-chain and timing checks reuse the simulator's
    feasibility gate (check_transfer), so both give the same reasons.
-3. Work out each candidate's safe donor capacity from its projected stock (forecast consumption and scheduled or
-   delayed replenishments), its retained floor (protected stock plus the provisional equity or operational reserve),
-   its usable batches and its safe surplus. Each limit is confirmed with the Ripple Simulator.
-4. Allocate donors, batches (earliest expiry first) and arrival days with Google OR-Tools CP-SAT
+3. Reject donors whose route is longer than the configured maximum travel time (6 hours by default).
+4. Work out each candidate's safe donor capacity from stock already received: forecast consumption with no scheduled,
+   delayed or other future replenishment, its retained floor (protected stock plus the equity or operational reserve),
+   its usable batches and its safe surplus. Each limit is confirmed with the Ripple Simulator. The recipient's own
+   projection keeps its scheduled and delayed replenishments.
+5. Allocate donors, batches (earliest expiry first) and arrival days with Google OR-Tools CP-SAT
    (app/allocation_solver.py), in integer hundredths of the unit.
-5. Run the complete plan through the Ripple Simulator. Only a plan the simulator marks safe is returned. Otherwise the
-   donors it rejects are excluded and the model is solved again; if no safe plan remains the result is 422 NO_SAFE_PLAN.
+6. Run the complete plan through the Ripple Simulator and re-check the travel limit and received-stock donor safety.
+   Only a plan that passes every check is returned. Otherwise the donors the simulator rejects are excluded and the
+   model is solved again; if no safe plan remains the result is 422 NO_SAFE_PLAN.
 
 EVERYTHING HERE IS SIMULATED DECISION SUPPORT. A plan is a proposal that a qualified person must approve. The
-optimizer never substitutes one medicine for another, never writes a transfer and never changes inventory. Objective
-weights and the equity rule are prototype assumptions awaiting review by Aaryan; they are not clinically validated.
+optimizer never substitutes one medicine for another, never writes a transfer and never changes inventory. The
+objective, equity guardrail, donor exclusions and travel-time limit are approved by Aaryan for the MEDRIPPLE hackathon
+prototype only; they are not clinically validated, and real deployment requires clinical, regulatory and operational
+validation.
 """
 
 from __future__ import annotations
@@ -43,7 +48,17 @@ from .allocation_solver import (
     solve_allocation,
     solver_version,
 )
-from .data_store import PROTECTED_STOCK_NOT_RECORDED, Batch, DataMapping, Facility, Medicine, Route, SimulatedDataStore
+from .data_store import (
+    APPROVED_FOR_HACKATHON_PROTOTYPE,
+    PROTECTED_STOCK_NOT_RECORDED,
+    Batch,
+    DataMapping,
+    Facility,
+    Medicine,
+    Replenishment,
+    Route,
+    SimulatedDataStore,
+)
 from .risk_engine import DEFAULT_RISK_CONFIG, RiskConfig, _number, _per_day, _quantity
 from .schemas import (
     CandidateBlock,
@@ -56,6 +71,8 @@ from .schemas import (
     PlanResponse,
     PlanTransferBlock,
     PlanValidationBlock,
+    ReceivedStockCheckBlock,
+    ReceivedStockDonorBlock,
     RecipientPlanBlock,
     SimulationDataContextBlock,
     SimulationMedicineBlock,
@@ -67,10 +84,14 @@ from .simulator import (
     ARRIVES_AFTER_RECIPIENT_STOCKOUT,
     BATCH_EXPIRES_BEFORE_USE,
     DECISION_SUPPORT_ASSUMPTION,
+    DEFAULT_MAX_TRAVEL_HOURS,
     EPSILON,
     FORECAST,
     MODEL_VERSION as SIMULATOR_MODEL_VERSION,
+    PATIENT_IMPACT_LIMITATION,
+    PROTOTYPE_VALIDATION_LIMITATION,
     STORAGE_FACILITY_TYPES,
+    TRAVEL_TIME_LIMIT_EXCEEDED,
     FacilityOutcome,
     FacilityState,
     ProposedTransfer,
@@ -78,15 +99,20 @@ from .simulator import (
     TransferEvaluation,
     baseline_outcome,
     build_simulation_response,
+    check_max_travel_hours,
     check_transfer,
+    check_travel_limit,
     describe_medicine,
+    exceeds_travel_limit,
     find_new_risks,
     load_facility_state,
     safe_surplus_at,
     simulate,
 )
+from .stock_projection import StockProjection, project_stock
 
-MODEL_VERSION = "aiml-transfer-optimizer-v1"
+MODEL_VERSION = "aiml-transfer-optimizer-v2"
+RECEIVED_STOCK_ONLY = "RECEIVED_STOCK_ONLY"
 SOLVER_NAME = "OR-Tools"
 SOLVER_ALGORITHM = "CP-SAT"
 PLAN_STATUS = "PROPOSED"
@@ -98,8 +124,8 @@ SELECTED = "SELECTED"
 ELIGIBLE_NOT_SELECTED = "ELIGIBLE_NOT_SELECTED"
 REJECTED = "REJECTED"
 
-# Candidate rejection codes. The simulator's gate adds ROUTE_NOT_FOUND, COLD_CHAIN_UNAVAILABLE, INCOMPLETE_DATA,
-# ARRIVAL_OUTSIDE_HORIZON and its other feasibility codes.
+# Candidate rejection codes. The simulator adds ROUTE_NOT_FOUND, COLD_CHAIN_UNAVAILABLE, INCOMPLETE_DATA,
+# ARRIVAL_OUTSIDE_HORIZON, TRAVEL_TIME_LIMIT_EXCEEDED and its other feasibility codes.
 DESTINATION_FACILITY = "DESTINATION_FACILITY"
 NO_INVENTORY_RECORD = "NO_INVENTORY_RECORD"
 NO_EFFECTIVE_STOCK = "NO_EFFECTIVE_STOCK"
@@ -109,6 +135,10 @@ DONOR_AT_RISK = "DONOR_AT_RISK"
 NO_SAFE_DONOR_CAPACITY = "NO_SAFE_DONOR_CAPACITY"
 CAPACITY_NOT_VERIFIED = "CAPACITY_NOT_VERIFIED"
 SIMULATION_REJECTED = "SIMULATION_REJECTED"
+# Received-stock evidence for any simulated plan (received_stock_evidence).
+WITHDRAWAL_EXCEEDS_RECEIVED_STOCK = "WITHDRAWAL_EXCEEDS_RECEIVED_STOCK"
+BELOW_RETAINED_FLOOR = "BELOW_RETAINED_FLOOR"
+DONOR_DATA_UNAVAILABLE = "DONOR_DATA_UNAVAILABLE"
 
 
 class OptimizationError(Exception):
@@ -140,11 +170,12 @@ def normalise_facility_type(facility_type: str) -> str:
 
 @dataclass(frozen=True)
 class OptimizerConfig:
-    """Prototype donor guardrails. PROVISIONAL until Aaryan reviews them; none is clinically validated.
+    """Donor guardrails approved by Aaryan for the MEDRIPPLE hackathon prototype only; none is clinically validated.
 
     retained floor      = max(protected stock x (1 + equity uplift), operational reserve)
     equity uplift       = facility-type uplift + remoteness weight x remoteness (0-1)
     operational reserve = warehouse operational reserve share x effective stock (storage facilities only)
+    route cap           = a donor route may take at most max_travel_hours (a route of exactly that length is allowed)
     """
 
     remoteness_weight: float = 0.5
@@ -155,10 +186,14 @@ class OptimizerConfig:
     default_type_uplift: float = 0.25
     warehouse_operational_reserve_share: float = 0.10
     excluded_donor_risk_labels: tuple[str, ...] = ("HIGH", "CRITICAL")
+    # Longest donor-to-destination route in hours; longer routes are rejected with TRAVEL_TIME_LIMIT_EXCEEDED. The Ripple
+    # Simulator is given this same value, so POST /scenarios/simulate and POST /plans/optimize apply one limit.
+    max_travel_hours: float = DEFAULT_MAX_TRAVEL_HOURS
     max_attempts: int = 5
     max_deterministic_time: float = 10.0
 
     def __post_init__(self) -> None:
+        check_max_travel_hours(self.max_travel_hours)
         weights = [*self.facility_type_uplift.values(), self.default_type_uplift, self.remoteness_weight]
         if any(not math.isfinite(weight) or weight < 0 for weight in weights):
             raise ValueError("Equity uplifts and the remoteness weight must be non-negative numbers.")
@@ -297,6 +332,9 @@ class Candidate:
     equity_reserve: float | None = None
     operational_reserve: float | None = None
     retained_floor: float | None = None
+    # Donor-only projection from stock already received (no future replenishment), and the future supply it leaves out.
+    received_projection: StockProjection | None = None
+    excluded_replenishments: tuple[Replenishment, ...] = ()
     options: list[DonorOption] = field(default_factory=list)
     reasons: list[tuple[str, str]] = field(default_factory=list)
     allocation: DonorAllocation | None = None
@@ -344,18 +382,66 @@ def consumption_description(state: FacilityState, unit: str) -> str:
     return f"forecast consumption of {_number(state.demand)} {_per_day(unit)}"
 
 
+@dataclass(frozen=True)
+class DonorFloor:
+    equity_uplift: float
+    equity_reserve: float
+    operational_reserve: float | None
+    retained_floor: float
+
+
+def donor_floor(state: FacilityState, config: OptimizerConfig) -> DonorFloor:
+    """The stock a donor must keep: max(protected stock + equity reserve, operational reserve), each rounded up."""
+    facility = state.facility
+    equity_uplift = config.equity_uplift(facility)
+    equity_reserve = ceil_hundredths(state.protected_stock * equity_uplift)
+    operational_reserve = None
+    if facility.type.upper() in STORAGE_FACILITY_TYPES:
+        operational_reserve = ceil_hundredths(config.warehouse_operational_reserve_share * state.effective_stock)
+    retained_floor = ceil_hundredths(max(state.protected_stock + equity_reserve, operational_reserve or 0.0))
+    return DonorFloor(equity_uplift, equity_reserve, operational_reserve, retained_floor)
+
+
+def project_received_stock(state: FacilityState, horizon_days: int, as_of: date, withdrawals: Mapping[int, float] | None = None) -> StockProjection:
+    """A donor's day-by-day projection from stock already received: the forecast engine's projection with no replenishment.
+
+    Only donor safety uses it. The recipient, POST /forecast and the Ripple Simulator keep scheduled and delayed
+    replenishments; ARRIVED stock is already part of effective stock and is never projected again.
+    """
+    return project_stock(state.effective_stock, state.demand, horizon_days, (), start_date=as_of, withdrawals=withdrawals)
+
+
+def received_stock_projection(scenario: Scenario, state: FacilityState, withdrawals: Mapping[int, float] | None = None) -> StockProjection:
+    return project_received_stock(state, scenario.horizon_days, scenario.store.as_of, withdrawals)
+
+
+def future_supply(scenario: Scenario, state: FacilityState) -> tuple[Replenishment, ...]:
+    """Open orders due within the horizon that donor capacity deliberately leaves out."""
+    return tuple(item for item in state.inventory.replenishments if 1 <= item.arrival_day <= scenario.horizon_days)
+
+
+def excluded_supply_text(candidate: Candidate, unit: str) -> str:
+    if not candidate.excluded_replenishments:
+        return ""
+    orders = "; ".join(
+        f"{_quantity(item.quantity, unit)} {item.status.lower()} for day {item.arrival_day}" for item in candidate.excluded_replenishments
+    )
+    return f" Future supply ({orders}) is deliberately not counted toward donor capacity; only stock already received counts."
+
+
 def arrival_options(scenario: Scenario, candidate: Candidate) -> list[DonorOption]:
     """Safe donor capacity for each useful arrival day.
 
     capacity = min(opening stock on the departure day,
-                   lowest projected closing stock from the departure day to the horizon end - retained floor,
+                   lowest received-stock projection from the departure day to the horizon end - retained floor,
                    usable batches that stay in date until the horizon end,
                    safe surplus at the snapshot - 0.01, so other facilities' regional fragility does not rise)
-    The projection already includes forecast consumption and scheduled or delayed replenishments, so the capacity is
-    never simply effective stock minus protected stock. Up to the floor a withdrawal lowers every later closing stock by
-    the same amount, which is why the lowest projected stock bounds it.
+    The received-stock projection includes forecast consumption but no future replenishment, so a scheduled or delayed
+    delivery can neither make a donor eligible nor raise its capacity, and capacity is never simply effective stock minus
+    protected stock. Up to the floor a withdrawal lowers every later closing stock by the same amount, which is why the
+    lowest projected stock bounds it.
     """
-    state, projection = candidate.state, candidate.baseline.projection
+    state, projection = candidate.state, candidate.received_projection
     travel_days = int(candidate.route.travel_hours // 24)
     lasting = sum(scaled(batch.quantity) for batch in candidate.lasting_batches)
     lasting -= lasting % scenario.step
@@ -376,12 +462,19 @@ def arrival_options(scenario: Scenario, candidate: Candidate) -> list[DonorOptio
 def explain_no_capacity(scenario: Scenario, candidate: Candidate) -> str:
     state, unit, name = candidate.state, scenario.unit, candidate.facility.name
     departure_day = max(1, candidate.earliest_arrival_day - int(candidate.route.travel_hours // 24))
-    lowest = min(candidate.baseline.projection.days[departure_day - 1:], key=lambda day: day.closing_stock)
+    lowest = min(candidate.received_projection.days[departure_day - 1:], key=lambda day: day.closing_stock)
     text = (
         f"{name} must keep {_quantity(candidate.retained_floor, unit)} ({reserve_description(candidate, unit)}). With "
-        f"{consumption_description(state, unit)} and its scheduled replenishments, its lowest projected stock from day "
+        f"{consumption_description(state, unit)} and no future deliveries counted, its lowest projected stock from day "
         f"{departure_day} is {_quantity(lowest.closing_stock, unit)} on day {lowest.day}, so it has no safe surplus to send."
     )
+    text += excluded_supply_text(candidate, unit)
+    with_future_supply = min(day.closing_stock for day in candidate.baseline.projection.days[departure_day - 1:]) - candidate.retained_floor
+    if candidate.excluded_replenishments and with_future_supply > EPSILON:
+        text += (
+            f" Counting that supply it would appear able to send {_quantity(with_future_supply, unit)}, but only because of that "
+            "future supply."
+        )
     naive = state.effective_stock - state.protected_stock
     if naive > EPSILON:
         text += (
@@ -410,6 +503,8 @@ def assess_candidate(scenario: Scenario, facility: Facility) -> Candidate:
     earliest = 1 + int(route.travel_hours // 24) if route is not None else 1
     probe = TransferEvaluation(0, ProposedTransfer(facility.id, destination.id, medicine.id, 1.0, earliest))
     check_transfer(scenario.store, scenario.states, medicine, scenario.horizon_days, probe)
+    # The simulator's own route-cap rule, so both report the same code and reason.
+    check_travel_limit([probe], config.max_travel_hours)
     for code, message in probe.reasons:
         candidate.reject(code, message)
     candidate.route = probe.route
@@ -417,11 +512,11 @@ def assess_candidate(scenario: Scenario, facility: Facility) -> Candidate:
     if not state.available:
         return candidate
 
-    candidate.equity_uplift = config.equity_uplift(facility)
-    candidate.equity_reserve = ceil_hundredths(state.protected_stock * candidate.equity_uplift)
-    if facility.type.upper() in STORAGE_FACILITY_TYPES:
-        candidate.operational_reserve = ceil_hundredths(config.warehouse_operational_reserve_share * state.effective_stock)
-    candidate.retained_floor = ceil_hundredths(max(state.protected_stock + candidate.equity_reserve, candidate.operational_reserve or 0.0))
+    candidate.received_projection = received_stock_projection(scenario, state)
+    candidate.excluded_replenishments = future_supply(scenario, state)
+    floor = donor_floor(state, config)
+    candidate.equity_uplift, candidate.equity_reserve = floor.equity_uplift, floor.equity_reserve
+    candidate.operational_reserve, candidate.retained_floor = floor.operational_reserve, floor.retained_floor
 
     as_of = scenario.store.as_of
     if state.effective_stock <= EPSILON:
@@ -472,7 +567,7 @@ def verify_capacity(scenario: Scenario, candidate: Candidate) -> None:
     earliest, largest = candidate.options[0], max(candidate.options, key=lambda option: (option.capacity, -option.arrival_day))
     for option in sorted({earliest, largest}, key=lambda item: item.arrival_day):
         transfer = ProposedTransfer(candidate.facility.id, scenario.destination.id, scenario.medicine.id, unscaled(option.capacity), option.arrival_day)
-        result = simulate(scenario.store, [transfer], scenario.horizon_days, scenario.risk_config)
+        result = simulate(scenario.store, [transfer], scenario.horizon_days, scenario.risk_config, scenario.config.max_travel_hours)
         evaluation = result.evaluations[0]
         donor_risks = [risk for risk in find_new_risks(result.baseline, result.intervention, scenario.unit) if risk.facility_id == candidate.facility.id]
         if not evaluation.eligible or donor_risks:
@@ -598,12 +693,124 @@ def validation_checks(
             "BATCH_ALLOCATION_MATCHES", not mismatched, "The simulator allocated exactly the planned batches and quantities.",
             f"The simulator allocated different stock for batch(es) {', '.join(mismatched)}.",
         ),
+        travel_limit_check(scenario, transfers),
+        received_stock_check(scenario, transfers),
         check(
             "SAFE_TO_RECOMMEND", comparison.safe_to_recommend,
             "The Ripple Simulator marks the complete plan safe to recommend for human review.",
             "The Ripple Simulator does not mark the complete plan safe to recommend.",
         ),
     ]
+
+
+def travel_limit_check(scenario: Scenario, transfers: Sequence[PlannedTransfer]) -> ValidationCheckBlock:
+    """The candidate route cap, applied again to the final plan."""
+    limit = scenario.config.max_travel_hours
+    too_long = list(dict.fromkeys(
+        f"{transfer.candidate.facility.id} ({_number(transfer.candidate.route.travel_hours)} h)"
+        for transfer in transfers
+        if exceeds_travel_limit(transfer.candidate.route, limit)
+    ))
+    return check(
+        "ROUTES_WITHIN_TRAVEL_LIMIT", not too_long,
+        f"Every donor route takes at most {_number(limit)} hours.",
+        f"Donor routes over the {_number(limit)}-hour limit: {', '.join(too_long)}.",
+    )
+
+
+def received_stock_check(scenario: Scenario, transfers: Sequence[PlannedTransfer]) -> ValidationCheckBlock:
+    """Each donor, projected from stock already received with its whole withdrawal on its departure day, keeps its floor."""
+    unit = scenario.unit
+    sent: dict[str, list] = {}
+    for transfer in transfers:
+        sent.setdefault(transfer.candidate.facility.id, [transfer.candidate, transfer.departure_day, 0])[2] += transfer.quantity
+    unsafe = []
+    for facility_id, (candidate, departure_day, units) in sent.items():
+        projection = received_stock_projection(scenario, candidate.state, {departure_day: unscaled(units)})
+        lowest = min(day.closing_stock for day in projection.days[departure_day - 1:])
+        if projection.withdrawal_shortfall > EPSILON or lowest < candidate.retained_floor - EPSILON:
+            unsafe.append(f"{facility_id} (lowest {_quantity(lowest, unit)} against a retained floor of {_quantity(candidate.retained_floor, unit)})")
+    return check(
+        "DONORS_SAFE_WITHOUT_FUTURE_SUPPLY", not unsafe,
+        "Counting only stock already received, every donor keeps its retained floor from departure to the end of the horizon.",
+        f"Donors that would rely on future supply: {'; '.join(unsafe)}.",
+    )
+
+
+def received_stock_evidence(result: SimulationResult, config: OptimizerConfig = DEFAULT_OPTIMIZER_CONFIG) -> ReceivedStockCheckBlock:
+    """The optimizer's donor rules applied to any simulated set of transfers, counting only stock already received.
+
+    Each donor's applied withdrawals leave on their departure days, no scheduled, delayed or other future supply is
+    counted, and the lowest closing stock from the first departure day must stay at or above the retained floor
+    (DONORS_SAFE_WITHOUT_FUTURE_SUPPLY). A donor also fails when a forecast facility has no recorded safety stock or when
+    it is already HIGH or CRITICAL without the transfers, as a candidate would. This is evidence alongside the simulation:
+    transfer eligibility and safeToRecommend are unchanged. The backend requires it to pass before reserving stock.
+    """
+    unit, horizon_days, as_of = result.medicine.unit, result.horizon_days, result.store.as_of
+    schedules: dict[str, dict[int, int]] = {}
+    for evaluation in result.evaluations:
+        if evaluation.applied and evaluation.departure_day is not None:
+            schedule = schedules.setdefault(evaluation.transfer.from_facility_id, {})
+            schedule[evaluation.departure_day] = schedule.get(evaluation.departure_day, 0) + scaled(evaluation.transfer.quantity)
+
+    donors = []
+    for facility_id, schedule in schedules.items():
+        state, first_day = result.states.get(facility_id), min(schedule)
+        total_sent = unscaled(sum(schedule.values()))
+        if state is None or not state.available:
+            reason = state.unavailable_reason if state is not None else "it has no inventory record for this medicine."
+            donors.append(ReceivedStockDonorBlock(
+                facility_id=facility_id, facility_name=state.facility.name if state is not None else facility_id, total_sent=total_sent,
+                retained_floor=0.0, lowest_projected_stock=0.0, lowest_projected_day=first_day, future_replenishment_excluded=0.0,
+                passed=False, failure_codes=[DONOR_DATA_UNAVAILABLE], explanation=f"{facility_id} cannot be projected: {reason}",
+            ))
+            continue
+        name, floor = state.facility.name, donor_floor(state, config)
+        projection = project_received_stock(state, horizon_days, as_of, {day: unscaled(units) for day, units in sorted(schedule.items())})
+        lowest = min(projection.days[first_day - 1:], key=lambda day: day.closing_stock)
+        excluded = unscaled(sum(scaled(item.quantity) for item in state.inventory.replenishments if 1 <= item.arrival_day <= horizon_days))
+        failures: list[tuple[str, str]] = []
+        if projection.withdrawal_shortfall > EPSILON:
+            failures.append((
+                WITHDRAWAL_EXCEEDS_RECEIVED_STOCK,
+                f"{name} does not hold {_quantity(projection.withdrawal_shortfall, unit)} of the stock it would send without future supply.",
+            ))
+        if lowest.closing_stock < floor.retained_floor - EPSILON:
+            failures.append((
+                BELOW_RETAINED_FLOOR,
+                f"Counting only stock already received, the lowest projected stock at {name} from day {first_day} would be "
+                f"{_quantity(lowest.closing_stock, unit)} on day {lowest.day}, below its retained floor of {_quantity(floor.retained_floor, unit)}.",
+            ))
+        if state.inventory.protected_stock_source == PROTECTED_STOCK_NOT_RECORDED and state.demand_basis == FORECAST:
+            failures.append((SAFETY_STOCK_NOT_RECORDED, f"{name} has no recorded safety stock, so a safe donor floor cannot be established."))
+        risk = result.baseline[facility_id].risk
+        if risk is not None and risk.label in config.excluded_donor_risk_labels:
+            failures.append((DONOR_AT_RISK, f"{name} is already {risk.label} risk ({risk.score}) without any transfer, so it is not asked to donate."))
+        if failures:
+            explanation = " ".join(message for _, message in failures)
+        else:
+            explanation = (
+                f"Counting only stock already received, {name} keeps its retained floor of {_quantity(floor.retained_floor, unit)} after "
+                f"sending {_quantity(total_sent, unit)}: its lowest projected stock from day {first_day} is "
+                f"{_quantity(lowest.closing_stock, unit)} on day {lowest.day}."
+            )
+        if excluded > EPSILON:
+            explanation += f" Future supply of {_quantity(excluded, unit)} due within the horizon is not counted."
+        donors.append(ReceivedStockDonorBlock(
+            facility_id=facility_id, facility_name=name, total_sent=total_sent, retained_floor=floor.retained_floor,
+            lowest_projected_stock=round(lowest.closing_stock, 2), lowest_projected_day=lowest.day, future_replenishment_excluded=excluded,
+            passed=not failures, failure_codes=[code for code, _ in failures], explanation=explanation,
+        ))
+
+    passed = bool(donors) and all(donor.passed for donor in donors)
+    if not donors:
+        explanation = "No transfer was applied, so no donor safety can be shown and nothing can be recommended."
+    elif passed:
+        explanation = "Counting only stock already received, every donor keeps its retained floor from departure to the end of the horizon."
+    else:
+        failed = ", ".join(donor.facility_id for donor in donors if not donor.passed)
+        explanation = f"Donors that fail the donor rules on stock already received: {failed}."
+    return ReceivedStockCheckBlock(basis=RECEIVED_STOCK_ONLY, passed=passed, donors=donors, explanation=explanation)
 
 
 def reject_failing_donors(candidates: Sequence[Candidate], transfers: Sequence[PlannedTransfer], result: SimulationResult, simulation: SimulationResponse) -> bool:
@@ -644,7 +851,7 @@ def reserve_text(candidate: Candidate, scenario: Scenario) -> str:
     return f"{_quantity(candidate.retained_floor, scenario.unit)} ({reserve_description(candidate, scenario.unit)})"
 
 
-def candidate_explanation(scenario: Scenario, candidate: Candidate, result: SimulationResult | None) -> str:
+def candidate_explanation(scenario: Scenario, candidate: Candidate) -> str:
     unit = scenario.unit
     if candidate.allocation is not None:
         allocation, route = candidate.allocation, candidate.route
@@ -653,26 +860,25 @@ def candidate_explanation(scenario: Scenario, candidate: Candidate, result: Simu
             for batch, quantity in zip(candidate.lasting_batches, allocation.batch_quantities)
             if quantity
         )
-        text = (
+        after = received_stock_projection(scenario, candidate.state, {allocation.departure_day: unscaled(allocation.total)})
+        lowest = min(day.closing_stock for day in after.days[allocation.departure_day - 1:])
+        return (
             f"Selected: sends {sent}, leaving on day {allocation.departure_day} and arriving on day {allocation.arrival_day} "
             f"({_number(route.distance_km)} km, {_number(route.travel_hours)} h{', cold-chain capable' if route.cold_chain_capable else ''}). "
             f"Its safe capacity is {_quantity(unscaled(candidate.capacity), unit)}, keeping at least {reserve_text(candidate, scenario)} "
-            f"through day {scenario.horizon_days}"
-        )
-        if result is not None:
-            days = result.intervention[candidate.facility.id].projection.days[allocation.departure_day - 1:]
-            text += f"; its lowest projected stock after the transfer is {_quantity(min(day.closing_stock for day in days), unit)}"
-        return text + "."
+            f"through day {scenario.horizon_days}; counting only stock already received, its lowest projected stock after the "
+            f"transfer is {_quantity(lowest, unit)}."
+        ) + excluded_supply_text(candidate, unit)
     if candidate.eligible:
         return (
             f"Eligible but not needed: it could safely send up to {_quantity(unscaled(candidate.capacity), unit)} while keeping "
             f"{reserve_text(candidate, scenario)}. The solver preferred donors that keep more headroom above their floor, then "
             "earlier arrival, shorter routes and fewer transfers."
-        )
+        ) + excluded_supply_text(candidate, unit)
     return "Rejected: " + " ".join(message for _, message in candidate.reasons)
 
 
-def candidate_block(scenario: Scenario, candidate: Candidate, result: SimulationResult | None = None) -> CandidateBlock:
+def candidate_block(scenario: Scenario, candidate: Candidate) -> CandidateBlock:
     state, route = candidate.state, candidate.route
     risk = candidate.baseline.risk if candidate.baseline is not None else None
     status = SELECTED if candidate.allocation is not None else ELIGIBLE_NOT_SELECTED if candidate.eligible else REJECTED
@@ -692,6 +898,7 @@ def candidate_block(scenario: Scenario, candidate: Candidate, result: Simulation
         operational_reserve=candidate.operational_reserve,
         retained_floor=candidate.retained_floor,
         lasting_batch_quantity=round(candidate.lasting_quantity, 2),
+        future_replenishment_excluded=round(sum(item.quantity for item in candidate.excluded_replenishments), 2),
         safe_capacity=unscaled(candidate.capacity),
         allocated_quantity=unscaled(candidate.allocation.total) if candidate.allocation else 0.0,
         baseline_risk_score=risk.score if risk else None,
@@ -699,7 +906,7 @@ def candidate_block(scenario: Scenario, candidate: Candidate, result: Simulation
         earliest_arrival_day=candidate.earliest_arrival_day,
         distance_km=route.distance_km if route else None,
         travel_hours=route.travel_hours if route else None,
-        explanation=candidate_explanation(scenario, candidate, result),
+        explanation=candidate_explanation(scenario, candidate),
     )
 
 
@@ -711,31 +918,42 @@ OPTIMIZER_ASSUMPTIONS = (
     "with more than 2 decimals is refused rather than rounded, and medicines counted in whole units move in whole units.",
     "Demand, stock projections, protected stock and risk come from the POST /forecast engine through the Ripple Simulator.",
     "Safe donor capacity is the smallest of: opening stock on the departure day; the lowest projected stock from departure to "
-    "the end of the horizon (after forecast consumption and scheduled or delayed replenishments) minus the retained floor; usable "
-    "batches in date until the end of the horizon; and the snapshot safe surplus less 0.01, so no other facility's regional "
-    "fragility rises.",
-    f"Retained floor (provisional equity guardrail): {EQUITY_FORMULA}.",
+    "the end of the horizon, counting only stock already received (forecast consumption with no scheduled, delayed or other "
+    "future replenishment), minus the retained floor; usable batches in date until the end of the horizon; and the snapshot "
+    "safe surplus less 0.01, so no other facility's regional fragility rises.",
+    "A future delivery never makes a donor eligible or increases what it may send, and ARRIVED stock is already in inventory "
+    "so it is not added again. The recipient's projection still counts its scheduled and delayed replenishments.",
+    f"Retained floor (equity guardrail approved for the hackathon prototype): {EQUITY_FORMULA}.",
     "Donors already at HIGH or CRITICAL risk, donors without recorded safety stock, and facilities whose demand cannot be "
     "forecast do not donate.",
+    "Missing route or logistics data is rejected, never assumed safe; a cold-chain medicine needs a cold-chain route and a "
+    "destination with cold-chain storage.",
     "Each donor delivers once, on the earliest useful day its route allows unless a later day is needed; a delivery that cannot "
     "arrive by the recipient's projected stockout day is not considered.",
     "The objective is optimised in lexicographic stages: recipient shortage (unmet demand, then shortage days), then donor "
     "protection and equity, then logistics (arrival day, distance, number of transfers). Donor safety and the exact quantity "
     "are hard constraints.",
-    "Batches are allocated earliest expiry first (then batch number); each batch is a separate transfer instruction because a "
-    "database transfer names one batch.",
+    "Batches are allocated earliest expiry first, then by database batch ID (by batch number only in the fixture, which has no "
+    "batch IDs); each batch is a separate transfer instruction because a database transfer names one batch.",
     "A plan is returned only after the Ripple Simulator evaluates the complete plan and marks it safe to recommend; the "
     "optimizer never declares its own result safe.",
     "The plan ID is a SHA-256 digest of the request, the transfers and the data context, so an identical request on unchanged "
-    "data returns the same ID.",
-    "Only the exact medicine identity is moved; the optimizer never substitutes one medicine for another.",
+    "data returns the same ID. It is authoritative: the Node backend must persist this ID rather than create another.",
+    "Only the exact medicine identity (same medicine, strength and dosage form) is moved; the optimizer never substitutes one "
+    "medicine for another, no request field can override this, and any alternative needs manual pharmacist or qualified "
+    "clinical review.",
 )
 OPTIMIZER_LIMITATIONS = (
-    "Objective weights, equity uplifts and the warehouse operational reserve are prototype assumptions, not clinically validated; "
-    "Aaryan must review them.",
+    "The objective, equity uplifts, warehouse operational reserve, donor exclusions, travel-time limit and received-stock-only "
+    "donor rule are approved by Aaryan for the hackathon prototype only; they are not clinically validated.",
+    PROTOTYPE_VALIDATION_LIMITATION,
+    PATIENT_IMPACT_LIMITATION,
+    "Emergency reduction of the warehouse reserve, outbreak exceptions for HIGH or CRITICAL donors and travel-time-derived "
+    "remoteness are not implemented: they need authenticated authorization data and an agreed definition.",
     "A donor's own dispensing is assumed not to use the batches chosen for transfer; expiry is handled only by sending batches "
     "that stay in date until the end of the horizon.",
-    "Vehicle capacity, transport cost, transport losses and the recipient's storage capacity are not modelled.",
+    "Vehicle and destination storage capacity, temperature logs, transport cost, transport losses and route-validity dates are "
+    "not modelled.",
     "Stock from replenishments arriving during the horizon has no recorded batch, so it is not sent onward.",
     "A slower donor that could only help in combination with a faster one, arriving after the recipient's projected stockout "
     "begins, is not considered.",
@@ -754,22 +972,46 @@ def optimizer_mappings(scenario: Scenario) -> list[DataMapping]:
             if database else "fixture facility type, remoteness and protected stock",
             rule=f"{EQUITY_FORMULA}.",
             review_owner="Aaryan",
+            status=APPROVED_FOR_HACKATHON_PROTOTYPE,
+        ),
+        DataMapping(
+            name="travelTimeLimit",
+            source="routes.transport_time_hours" if database else "fixture route travel hours",
+            rule=(
+                f"A donor route may take at most {_number(scenario.config.max_travel_hours)} hours; a longer route is rejected "
+                "with TRAVEL_TIME_LIMIT_EXCEEDED and a missing route is rejected, never assumed safe."
+            ),
+            review_owner="Aaryan",
+            status=APPROVED_FOR_HACKATHON_PROTOTYPE,
+        ),
+        DataMapping(
+            name="donorReceivedStockOnly",
+            source="inventory (effective stock) and replenishments.status" if database else "fixture inventory and replenishments",
+            rule=(
+                "Donor capacity counts only stock already in effective inventory; SCHEDULED, DELAYED and other future replenishments "
+                "are ignored for donors but still projected for the recipient."
+            ),
+            review_owner="Aaryan",
+            status=APPROVED_FOR_HACKATHON_PROTOTYPE,
         ),
         DataMapping(
             name="batchIdentity",
             source="inventory.batch_id, batches.batch_number, batches.expiry_date" if database else "fixture batch numbers and expiry dates",
             rule=(
-                "Each transfer instruction names one batch, allocated earliest expiry first; batchId is batches.batch_id."
-                if database else "Each transfer instruction names one batch, allocated earliest expiry first; batchId is the batch number, "
-                "as in backend/src/fixture-store.js."
+                "Each transfer instruction names one batch, allocated earliest expiry first and then by batches.batch_id; batchId is "
+                "batches.batch_id. Persisting it in transfers is Sahil's pending Node work."
+                if database else "Each transfer instruction names one batch, allocated earliest expiry first and then by batch number "
+                "(the fixture has no batch IDs); batchId is the batch number, as in backend/src/fixture-store.js."
             ),
-            review_owner="Dhiren and Sahil",
+            review_owner="Dhiren",
+            status=APPROVED_FOR_HACKATHON_PROTOTYPE,
         ),
         DataMapping(
             name="quantityScale",
             source="DECIMAL(12,2) quantities and medicines.base_unit" if database else "fixture quantities",
             rule="Quantities are solved as integer hundredths and returned with their decimals; count medicines move in whole units; nothing is rounded.",
             review_owner="Dhiren",
+            status=APPROVED_FOR_HACKATHON_PROTOTYPE,
         ),
     ]
 
@@ -799,6 +1041,8 @@ def plan_assumptions(scenario: Scenario) -> list[str]:
     mappings = [*context.mappings, *optimizer_mappings(scenario)]
     return [
         *OPTIMIZER_ASSUMPTIONS,
+        f"A donor route may take at most {_number(scenario.config.max_travel_hours)} hours (configurable; approved for the hackathon "
+        "prototype); a longer route is rejected with TRAVEL_TIME_LIMIT_EXCEEDED.",
         context.protected_stock_assumption,
         DECISION_SUPPORT_ASSUMPTION,
         *(f"{item.name}: {item.rule.rstrip('.')} ({item.status.replace('_', ' ').lower()}; review: {item.review_owner})." for item in mappings),
@@ -813,8 +1057,11 @@ def equity_block(config: OptimizerConfig) -> EquityGuardrailBlock:
         default_type_uplift=config.default_type_uplift,
         warehouse_operational_reserve_share=config.warehouse_operational_reserve_share,
         excluded_donor_risk_labels=list(config.excluded_donor_risk_labels),
-        status="PROVISIONAL",
+        max_travel_hours=config.max_travel_hours,
+        donor_capacity_basis=RECEIVED_STOCK_ONLY,
+        status=APPROVED_FOR_HACKATHON_PROTOTYPE,
         review_owner="Aaryan",
+        validation_note=PROTOTYPE_VALIDATION_LIMITATION,
     )
 
 
@@ -883,8 +1130,9 @@ def plan_rationale(
     sentences = [
         f"The plan supplies the requested {_quantity(unscaled(scenario.requested), unit)} of {describe_medicine(scenario.medicine)} to "
         f"{destination.name} from {len(selected)} donor{'s' if len(selected) != 1 else ''} in {len(transfers)} batch transfer(s): {donors}.",
-        "Every donor keeps its protected safety stock plus the provisional equity or operational reserve on every day from departure "
-        "to the end of the horizon, and none gains a shortage.",
+        "Counting only stock already received, every donor keeps its protected safety stock plus the equity or operational reserve "
+        "on every day from departure to the end of the horizon, none gains a shortage, and every route takes at most "
+        f"{_number(scenario.config.max_travel_hours)} hours.",
     ]
     if recipient.stockout_day_before is None:
         sentences.append(f"{destination.name} had no projected stockout in the {scenario.horizon_days}-day horizon; the transfer adds buffer stock.")
@@ -982,7 +1230,7 @@ def build_plan(
             for transfer in transfers
         ],
         recipient=recipient,
-        candidates=[candidate_block(scenario, candidate, result) for candidate in candidates],
+        candidates=[candidate_block(scenario, candidate) for candidate in candidates],
         equity_guardrail=equity_block(scenario.config),
         rationale=plan_rationale(scenario, candidates, transfers, recipient, simulation),
         validation=PlanValidationBlock(validator=f"Ripple Simulator {SIMULATOR_MODEL_VERSION}", passed=True, checks=list(checks)),
@@ -1064,11 +1312,35 @@ def no_safe_plan_details(scenario: Scenario, candidates: Sequence[Candidate], st
         candidates_considered=len(considered),
         eligible_candidates=[candidate_block(scenario, candidate) for candidate in eligible],
         rejected_candidates=[candidate_block(scenario, candidate) for candidate in rejected],
-        recommended_escalation=recommended_escalation(scenario, safe_capacity),
+        recommended_escalation=[*recommended_escalation(scenario, safe_capacity), *donor_rule_escalation(scenario, rejected)],
         explanation=explanation,
+        equity_guardrail=equity_block(scenario.config),
         decision_support_only=True,
         data_context=plan_data_context(scenario),
     )
+
+
+def donor_rule_escalation(scenario: Scenario, rejected: Sequence[Candidate]) -> list[str]:
+    """Name the donors held back by the reviewed rules; no rule is relaxed to meet a request."""
+    items = []
+    too_far = [candidate.facility.id for candidate in rejected if any(code == TRAVEL_TIME_LIMIT_EXCEEDED for code, _ in candidate.reasons)]
+    if too_far:
+        items.append(
+            f"{', '.join(too_far)} {'is' if len(too_far) == 1 else 'are'} beyond the {_number(scenario.config.max_travel_hours)}-hour "
+            "route limit; a longer transfer would need logistics and clinical approval outside this prototype and is not proposed."
+        )
+    # Only donors held back by capacity alone: a delivery cannot fix a long route, a missing cold chain or a HIGH risk.
+    waiting = [
+        candidate.facility.id
+        for candidate in rejected
+        if candidate.excluded_replenishments and {code for code, _ in candidate.reasons} == {NO_SAFE_DONOR_CAPACITY}
+    ]
+    if waiting:
+        items.append(
+            f"{', '.join(waiting)} could be reassessed after their scheduled or delayed deliveries are received; future stock is "
+            "never counted toward donor capacity."
+        )
+    return items
 
 
 def run_optimization(
@@ -1097,8 +1369,8 @@ def run_optimization(
             ProposedTransfer(transfer.candidate.facility.id, scenario.destination.id, scenario.medicine.id, unscaled(transfer.quantity), transfer.arrival_day)
             for transfer in transfers
         ]
-        result = simulate(store, proposed, scenario.horizon_days, risk_config)
-        simulation = build_simulation_response(result)
+        result = simulate(store, proposed, scenario.horizon_days, risk_config, scenario.config.max_travel_hours)
+        simulation = build_simulation_response(result, received_stock_evidence(result, config))
         checks = validation_checks(scenario, transfers, result, simulation)
         if all(item.passed for item in checks):
             return build_plan(scenario, candidates, transfers, allocation, attempts, result, simulation, checks)

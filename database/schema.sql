@@ -17,6 +17,7 @@ SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS audit_events;
 DROP TABLE IF EXISTS app_users;
 DROP TABLE IF EXISTS transfers;
+DROP TABLE IF EXISTS plans;
 DROP TABLE IF EXISTS routes;
 DROP TABLE IF EXISTS replenishments;
 DROP TABLE IF EXISTS inventory;
@@ -260,6 +261,7 @@ START TRANSACTION;
 
 DELETE FROM audit_events;
 DELETE FROM transfers;
+DELETE FROM plans;
 DELETE FROM routes;
 DELETE FROM replenishments;
 DELETE FROM inventory;
@@ -742,11 +744,12 @@ FROM (
 
 -- ---------------------------------------------------------------------
 -- TRANSFERS
--- Includes completed, approved, proposed, and rejected examples.
+-- Includes delivered, approved, proposed, and rejected examples.
 -- ---------------------------------------------------------------------
 
 DROP TEMPORARY TABLE IF EXISTS sim_transfer_requests;
 CREATE TEMPORARY TABLE sim_transfer_requests (
+    plan_id VARCHAR(64),
     origin_facility_id INT,
     destination_facility_id INT,
     medicine_id INT,
@@ -759,33 +762,83 @@ CREATE TEMPORARY TABLE sim_transfer_requests (
 );
 
 INSERT INTO sim_transfer_requests VALUES
-(1, 2, 7,  420.00,  'COMPLETED',       NULL, 48, 'Regional Supply Officer',
+('simulated-history-transfer-001', 1, 2, 7,  420.00,  'DELIVERED',       NULL, 48, 'Regional Supply Officer',
  'Emergency insulin redistribution from the regional warehouse'),
 
-(1, 3, 2,  850000.00, 'COMPLETED',     NULL, 41, 'Regional Supply Officer',
+('simulated-history-transfer-002', 1, 3, 2,  850000.00, 'DELIVERED',     NULL, 41, 'Regional Supply Officer',
  'Routine redistribution after demand increase'),
 
-(2, 6, 8,  180.00,  'APPROVED',        NULL, 26, 'District Pharmacist',
+('simulated-history-transfer-003', 2, 6, 8,  180.00,  'APPROVED',        NULL, 26, 'District Pharmacist',
  'Approved cold-chain transfer'),
 
-(3, 8, 9,  95.00,   'REJECTED_UNSAFE',
+('simulated-history-transfer-004', 3, 8, 9,  95.00,   'REJECTED_UNSAFE',
  'Destination has no validated cold-chain storage', 21, NULL,
  'Rejected by automated cold-chain feasibility gate'),
 
-(4, 7, 6,  410000.00, 'COMPLETED',     NULL, 17, 'District Pharmacist',
+('simulated-history-transfer-005', 4, 7, 6,  410000.00, 'DELIVERED',     NULL, 17, 'District Pharmacist',
  'ORS transferred in response to seasonal demand'),
 
-(5, 10, 10, 30.00,  'APPROVED',        NULL, 12, 'Regional Medical Officer',
+('simulated-history-transfer-006', 5, 10, 10, 30.00,  'APPROVED',        NULL, 12, 'Regional Medical Officer',
  'Emergency adrenaline stock balancing'),
 
-(6, 9, 1,  190000.00, 'PROPOSED',      NULL, 7, NULL,
+('simulated-history-transfer-007', 6, 9, 1,  190000.00, 'PROPOSED',      NULL, 7, NULL,
  'Awaiting donor safety-stock review'),
 
-(7, 4, 4,  275000.00, 'REJECTED_UNSAFE',
+('simulated-history-transfer-008', 7, 4, 4,  275000.00, 'REJECTED_UNSAFE',
  'Projected donor stock would fall below protected safety stock', 4, NULL,
  'Rejected by donor safety-stock feasibility gate');
 
+-- Historical demo transfers predate persisted optimiser plans. Represent each
+-- one with a clearly labelled simulated plan without reserving stock again or
+-- fabricating a new approval event.
+INSERT INTO plans (
+    plan_id,
+    destination_facility_id,
+    medicine_id,
+    requested_quantity,
+    horizon_days,
+    status,
+    rationale,
+    plan_json,
+    created_at,
+    decided_at,
+    decided_by
+)
+SELECT
+    t.plan_id,
+    t.destination_facility_id,
+    t.medicine_id,
+    t.quantity,
+    14,
+    CASE
+        WHEN t.status = 'REJECTED_UNSAFE' THEN 'REJECTED'
+        ELSE t.status
+    END,
+    CONCAT('Simulated historical record: ', t.note),
+    JSON_OBJECT(
+        'id', t.plan_id,
+        'simulatedHistoricalRecord', TRUE,
+        'source', 'MYSQL_SCHEMA_SEED',
+        'destinationFacilityId', t.destination_facility_id,
+        'medicineId', t.medicine_id,
+        'requestedQuantity', t.quantity,
+        'horizonDays', 14,
+        'status', CASE WHEN t.status = 'REJECTED_UNSAFE' THEN 'REJECTED' ELSE t.status END,
+        'note', t.note
+    ),
+    TIMESTAMP(DATE_SUB(@history_end, INTERVAL t.days_ago DAY), '09:30:00'),
+    CASE
+        WHEN t.status = 'PROPOSED' THEN NULL
+        ELSE TIMESTAMP(DATE_SUB(@history_end, INTERVAL t.days_ago DAY), '13:30:00')
+    END,
+    CASE
+        WHEN t.status = 'PROPOSED' THEN NULL
+        ELSE COALESCE(t.approved_by, 'MEDRIPPLE Feasibility Engine')
+    END
+FROM sim_transfer_requests t;
+
 INSERT INTO transfers (
+    plan_id,
     origin_facility_id,
     destination_facility_id,
     medicine_id,
@@ -799,6 +852,7 @@ INSERT INTO transfers (
     note
 )
 SELECT
+    t.plan_id,
     t.origin_facility_id,
     t.destination_facility_id,
     t.medicine_id,
@@ -811,7 +865,7 @@ SELECT
         '09:30:00'
     ),
     CASE
-        WHEN t.status IN ('APPROVED','COMPLETED') THEN
+        WHEN t.status IN ('APPROVED','DELIVERED') THEN
             TIMESTAMP(
                 DATE_SUB(@history_end, INTERVAL t.days_ago DAY),
                 '13:30:00'
@@ -824,6 +878,7 @@ FROM sim_transfer_requests t
 JOIN batches b
   ON b.medicine_id = t.medicine_id
 GROUP BY
+    t.plan_id,
     t.origin_facility_id,
     t.destination_facility_id,
     t.medicine_id,
@@ -854,7 +909,7 @@ SELECT
     t.transfer_id,
     CASE
         WHEN t.status = 'REJECTED_UNSAFE' THEN 'REJECT'
-        WHEN t.status IN ('APPROVED','COMPLETED') THEN 'APPROVE'
+        WHEN t.status IN ('APPROVED','DELIVERED') THEN 'APPROVE'
         ELSE 'SIMULATE'
     END,
     COALESCE(t.approved_by, 'MEDRIPPLE Feasibility Engine'),

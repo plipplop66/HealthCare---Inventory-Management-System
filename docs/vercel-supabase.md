@@ -18,8 +18,14 @@ The frontend and intelligence projects deploy from their respective directories.
 
 Supabase PostgreSQL stores accounts, inventory, consumption, proposed plans,
 transfer lifecycle state, and audit history. This is real persistent storage,
-not a process-local fixture. The current four-facility insulin dataset is still
-**simulated**, referenced to 2026-09-11. No external hospital feed is connected.
+not a process-local fixture. All of its data is **simulated**, referenced to
+2026-09-11. The deployed database still holds the earlier four-facility insulin
+dataset; the release candidate on `test-branch-2` expects migration 005, which
+adds the final 16-facility demo dataset (see
+[release-checklist.md](release-checklist.md)). No external hospital feed is connected.
+The dashboard summarises insulin only. Plans are decision support: stock is
+reserved only after a human approval, and every decision is audited. API
+timestamps are UTC instants (see `docs/api-contract.md`).
 The dashboard polls every 30 seconds while visible and refreshes on focus.
 This is polling, not a Supabase Realtime/WebSocket subscription.
 
@@ -30,9 +36,12 @@ honestly reported as low-confidence. Safety-policy confirmation remains a
 human responsibility; the seed does not claim Aaryan has approved it.
 
 Forecast outages return an explicitly labelled database fallback. Persistent
-plan optimization fails closed if the intelligence optimizer is unavailable;
-it does not substitute an inventory-reserving fixture plan. A failed AI section
-does not prevent the regional dashboard from loading.
+simulation and plan optimization fail closed (`503`) if the intelligence service
+is unavailable; they never substitute local Node rules or an inventory-reserving
+fixture plan. Approval re-runs the plan's exact transfers through the
+intelligence simulator before the database reserves stock, and fails closed the
+same way (see `docs/api-contract.md`). A failed AI section does not prevent the
+regional dashboard from loading.
 
 ## Configuration
 
@@ -64,8 +73,16 @@ the project's Database Settings download. Its SHA-256 fingerprint is
 `schema-postgres.sql` is an **initialization/reset script with DROP statements**.
 Never rerun it on the deployed database. The live schema already exists.
 
-- `database/seed-postgres.sql` is additive: conflicts do not reset inventory or
-  overwrite accounts, plans, or audits. It contains no public approver account.
+- `database/seed-postgres.sql` is the fresh-install seed for a new database: the
+  final demo dataset with fixed IDs (see `database/README.md`). It refuses to run
+  where those IDs already belong to other rows, as on the deployed database, and
+  it contains no public approver account.
+- `database/migrations/005_expand_final_demo_scenarios_postgres.sql` adds the same
+  dataset to an existing database. It is insert-only and never resets inventory
+  or touches accounts, plans, transfers or audits. It has not been applied to the
+  deployed database; doing so is a separate owner-approved change, following
+  [release-checklist.md](release-checklist.md) (backup, migration, verification with
+  `database/verify-005-postgres.sql`, deployment order and rollback).
 - `database/secure-supabase.sql` enables RLS and revokes direct table privileges
   from `anon` and `authenticated`. Only server-side SQL clients access tables.
 - Do not grant direct browser access to `app_users` or audit/transfer tables.
@@ -81,16 +98,22 @@ Existing sessions consult current account status/role on each API request.
 npm run setup
 npm run check
 npm test
+npm --prefix frontend test
 npm run build:frontend
 python -m pip install -r intelligence/requirements.txt
 python -m pytest intelligence/tests
-$env:ACCEPTANCE_BASE_URL='https://health-care-inventory-management-sy-ecru.vercel.app'
-node backend/scripts/live-acceptance.js
 ```
 
-The live check creates one uniquely named operator and one proposed plan. It
+Read-only production checks are in [release-checklist.md](release-checklist.md)
+(sections 7 and 8).
+
+`backend/scripts/live-acceptance.js` is **not** read-only. It creates one uniquely
+named operator and one proposed plan in the target database, so run it against
+production only with the owner's approval
+(`ACCEPTANCE_BASE_URL=<API origin> node backend/scripts/live-acceptance.js`). It
 tests persistent signup/login, database reads, AI forecasts/optimization, plan
 retrieval, and forbidden operator approval. It never approves or moves stock.
+It looks for the earlier dataset's `PHC-NAV-001`, which migration 005 keeps.
 Its test account can be disabled after the check; do not remove audit history.
 
 ## Production boundaries still requiring owner acceptance

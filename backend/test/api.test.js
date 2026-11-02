@@ -40,6 +40,13 @@ test('health endpoint identifies the running backend', async () => {
   assert.equal(body.data.dataSource, 'FIXTURE_STORE');
 });
 
+test('the region summary reports simulated coverage risk without a patient-impact metric', async () => {
+  const { response, body } = await request('/api/region/summary', { headers: approverHeaders });
+  assert.equal(response.status, 200);
+  assert.deepEqual(Object.keys(body.data).sort(), ['alerts', 'criticalFacilityCount', 'dataFreshness', 'earliestStockout', 'resilienceScore']);
+  assert.doesNotMatch(JSON.stringify(body), /patient/i);
+});
+
 test('inventory excludes expired stock from effective stock', async () => {
   const { response, body } = await request('/api/facilities/facility-navjeevan-phc/inventory', { headers: approverHeaders });
   assert.equal(response.status, 200);
@@ -69,6 +76,10 @@ test('simulator rejects a transfer that drains a donor below protected safety st
   assert.equal(response.status, 200);
   assert.equal(body.data.transferEvaluations[0].eligible, false);
   assert.match(body.data.transferEvaluations[0].rejectionReasons[0], /protected safety stock/);
+  // The local rules are a labelled development fallback, not the intelligence service.
+  assert.deepEqual([body.data.source, body.data.isFallback, body.data.fallbackReason], ['FIXTURE_FALLBACK', true, 'INTELLIGENCE_UNAVAILABLE']);
+  assert.deepEqual([body.meta.source, body.meta.fallback], ['FIXTURE_FALLBACK', true]);
+  assert.doesNotMatch(JSON.stringify(body.data), /patient/i);
 });
 
 test('safe plan can be approved and creates an audit record', async () => {
@@ -78,6 +89,8 @@ test('safe plan can be approved and creates an audit record', async () => {
   });
   assert.equal(planResponse.response.status, 200);
   assert.equal(planResponse.body.data.simulation.comparison.safeToRecommend, true);
+  assert.deepEqual([planResponse.body.data.source, planResponse.body.data.isFallback, planResponse.body.meta.fallback], ['FIXTURE_FALLBACK', true, true]);
+  assert.equal(planResponse.body.data.simulation.source, 'FIXTURE_FALLBACK');
 
   const approval = await request(`/api/plans/${planResponse.body.data.id}/approve`, {
     method: 'POST', headers: { 'content-type': 'application/json', ...approverHeaders },
@@ -87,6 +100,9 @@ test('safe plan can be approved and creates an audit record', async () => {
   assert.equal(approval.body.data.plan.status, 'APPROVED');
   assert.equal(approval.body.data.audit.action, 'PLAN_APPROVED');
   assert.equal(approval.body.data.persistence.storage, 'MEMORY');
+  // A fixture approval reserves nothing and says it is not a production safety check.
+  assert.deepEqual([approval.body.data.revalidation.performed, approval.body.data.revalidation.reason], [false, 'FIXTURE_MODE']);
+  assert.equal(approval.body.data.audit.afterState.revalidation.reason, 'FIXTURE_MODE');
 
   const audit = await request('/api/audit', { headers: approverHeaders });
   assert.equal(audit.response.status, 200);

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Icon } from './Icon';
 
-export function AuthScreen({ onAuthenticate, api }) {
+export function AuthScreen({ onAuthenticate, api, notice = '' }) {
   const [mode, setMode] = useState('login');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -58,6 +58,7 @@ export function AuthScreen({ onAuthenticate, api }) {
         <label className="auth-field">Email address<input value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" type="email" maxLength="254" required placeholder="name@organisation.org" /></label>
         <label className="auth-field">Password<input value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={signingUp ? 'new-password' : 'current-password'} type="password" minLength="10" maxLength="200" required placeholder="At least 10 characters" /></label>
         {signingUp && <label className="auth-field">Confirm password<input value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" type="password" minLength="10" maxLength="200" required placeholder="Repeat your password" /></label>}
+        {notice && !error && <p className="auth-error" role="status"><Icon name="alert" size={16} />{notice}</p>}
         {error && <p className="auth-error" role="alert"><Icon name="alert" size={16} />{error}</p>}
         <button className="mr-button primary auth-submit" disabled={busy} type="submit">{busy ? 'Please wait…' : signingUp ? 'Create account' : 'Sign in'}<Icon name="arrow" /></button>
         {!signingUp && <p className="auth-privacy">Accounts and decisions are stored in the database. Create your own account; approval authority is assigned separately.</p>}
